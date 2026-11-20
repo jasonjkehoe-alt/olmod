@@ -24,6 +24,12 @@ namespace GameMod
     //   fly through is the fiction-consistent recovery, and it is the only one
     //   that works when the block is between the bot and the player.
     //
+    // LIMITLESS (Nov 19): the recoveries above have no per-goal cap. The
+    // 3-per-goal budget was removed — it bit hardest in the worst stretches
+    // (three wedges close together and the bot went dead). The trigger paces
+    // recovery, every recovery is logged, and the bot only recovers when the
+    // player is on the goal route, so it is catching up, not cheating.
+    //
     // The auto-resume half of the return needs no new code: WANDER_NEAR_PLAYER
     // already calls GuidebotResumePreviousSubmode() when the bot is within 10 m,
     // but the field it reads (AI_guidebot_previous_submode) is never assigned
@@ -63,10 +69,15 @@ namespace GameMod
         // counter can never climb past 51 while wedged; counting reset firings
         // is the equivalent of a ~3 s threshold on the raw counter.
         private const int kResetFiringsToTrigger = 3;
-        // Max recoveries for one goal before we stop flipping (anti yo-yo).
-        private const int kMaxRecoveriesPerGoal = 3;
-        // If the bot goes this long without wedging, the recovery budget resets.
-        private const float kRecoveryBudgetWindow = 60f;
+        // LIMITLESS (Nov 19): there is deliberately no cap on recoveries or
+        // teleports per goal. The 3-per-goal budget was removed because it bit
+        // hardest in the worst stretches (the slot, the pipe and 42/807 are all
+        // on the way to the key, close together — three wedges and the bot went
+        // dead). The trigger itself paces recovery (~3-5 s wedged per firing),
+        // every recovery is logged, and the bot only recovers when the player
+        // is on the goal route (behind -> return, ahead -> teleport), so it is
+        // catching up, not cheating. The per-goal counters below are now just
+        // for the log lines (they reset on a goal change); nothing gates on them.
 
         // Private Robot members, resolved lazily-safe: if any lookup returns null
         // (a future game build renamed a member) the prefix no-ops and logs once
@@ -82,18 +93,14 @@ namespace GameMod
 
         private static int s_resetFirings;       // consecutive stock-reset firings, no index progress
         private static int s_lastPathIndex = -1; // Global_path_index at last observation
-        private static int s_recoveries;         // return recoveries spent on the current goal
-        private static float s_lastRecoveryTime = -1000f;
+        private static int s_recoveries;         // return recoveries on the current goal (log only, no cap)
         private static AIGuidebotSubmodeType s_recoveryGoal = AIGuidebotSubmodeType.NONE;
-        private static AIGuidebotSubmodeType s_exhaustedGoal = AIGuidebotSubmodeType.NONE;
         private static bool s_accessorsLogged;
-        // Teleport budget: SEPARATE from the return budget (the key route has
-        // three blocks; a shared budget could be exhausted by one flaky block
-        // and leave none for the others). Same rules, independent counters.
-        private static int s_teleports;          // teleports spent on the current goal
-        private static float s_lastTeleportTime = -1000f;
+        // Teleport counter: SEPARATE from the return counter (the key route has
+        // three blocks; a shared counter would conflate them). Both are log-only
+        // now — there is no budget, so no exhausted state and no time window.
+        private static int s_teleports;          // teleports on the current goal (log only, no cap)
         private static AIGuidebotSubmodeType s_teleportGoal = AIGuidebotSubmodeType.NONE;
-        private static AIGuidebotSubmodeType s_teleportExhaustedGoal = AIGuidebotSubmodeType.NONE;
         private static bool s_teleportAccessorsLogged;
 
         private static FieldInfo GetField(string name)
@@ -210,35 +217,15 @@ namespace GameMod
                 return;
             }
 
-            // Player BEHIND the bot on the route: the return branch, unchanged.
-            // Retry bound: after 3 recoveries for this goal without the bot going
-            // 60 s without wedging, stop flipping and leave it wandering. A new
-            // goal, or a quiet 60 s, lifts the give-up.
+            // Player BEHIND the bot on the route: the return branch. LIMITLESS:
+            // the per-goal counter below is log-only (reset on a goal change so
+            // the log count reads per goal). There is no cap, no give-up and no
+            // time window — a wedged bot always comes back while the player is
+            // behind it on the route.
             if (submode != s_recoveryGoal)
             {
                 s_recoveryGoal = submode;
                 s_recoveries = 0;
-                s_exhaustedGoal = AIGuidebotSubmodeType.NONE;
-            }
-            if (submode == s_exhaustedGoal)
-            {
-                if (gameTime - s_lastRecoveryTime > kRecoveryBudgetWindow)
-                {
-                    s_exhaustedGoal = AIGuidebotSubmodeType.NONE;
-                    s_recoveries = 0;
-                }
-                else
-                {
-                    return;
-                }
-            }
-            if (gameTime - s_lastRecoveryTime > kRecoveryBudgetWindow)
-                s_recoveries = 0;
-            if (s_recoveries >= kMaxRecoveriesPerGoal)
-            {
-                s_exhaustedGoal = submode;
-                Debug.Log("[GuidebotStuckReturn] giving up on goal " + submode + " after " + s_recoveries + " recoveries; leaving the bot wandering.");
-                return;
             }
 
             // Flip to return. Order matters: save the interrupted goal FIRST
@@ -251,7 +238,6 @@ namespace GameMod
             // the goal case re-derives m_guidebot_goal_segment on resume, so
             // nothing else needs saving.
             s_recoveries++;
-            s_lastRecoveryTime = gameTime;
             s_previousSubmodeField.SetValue(null, submode);
             s_deactivateTimerField.SetValue(null, gameTime + 30f);
             try
@@ -278,34 +264,14 @@ namespace GameMod
         // m_guidebot_goal and m_guidebot_special_goal_segment are not touched.
         static bool TeleportForward(Robot bot, PlayerShip ship, int playerSeg, int playerPos, int botIndex, AIGuidebotSubmodeType submode, float gameTime)
         {
-            // Separate teleport budget: 3 per goal, independent of the return
-            // budget, same reset rules (goal change, or 60 s without wedging).
+            // Separate teleport counter, log-only (reset on a goal change so the
+            // log count reads per goal). LIMITLESS: no cap, no give-up, no time
+            // window — a wedged bot always teleports forward while the player is
+            // ahead of it on the route.
             if (submode != s_teleportGoal)
             {
                 s_teleportGoal = submode;
                 s_teleports = 0;
-                s_teleportExhaustedGoal = AIGuidebotSubmodeType.NONE;
-            }
-            if (submode == s_teleportExhaustedGoal)
-            {
-                if (gameTime - s_lastTeleportTime > kRecoveryBudgetWindow)
-                {
-                    s_teleportExhaustedGoal = AIGuidebotSubmodeType.NONE;
-                    s_teleports = 0;
-                }
-                else
-                {
-                    Debug.Log("[GuidebotStuckReturn] teleport budget exhausted for goal " + submode + "; staying put.");
-                    return false;
-                }
-            }
-            if (gameTime - s_lastTeleportTime > kRecoveryBudgetWindow)
-                s_teleports = 0;
-            if (s_teleports >= kMaxRecoveriesPerGoal)
-            {
-                s_teleportExhaustedGoal = submode;
-                Debug.Log("[GuidebotStuckReturn] giving up teleporting for goal " + submode + " after " + s_teleports + " teleports; leaving the bot wandering.");
-                return false;
             }
 
             // Spawn position, mirroring SpawnGuideBot: 2 m in front of the
@@ -340,7 +306,6 @@ namespace GameMod
 
             int fromSeg = bot.Global_path[botIndex];
             s_teleports++;
-            s_lastTeleportTime = gameTime;
 
             // Move the bot instance. Do NOT destroy/respawn: a respawned bot
             // lands in submode START, whose DoModeGuidebot case only calls
