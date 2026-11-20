@@ -132,6 +132,7 @@
     <Compile Include="GSyncFix.cs" />
     <Compile Include="GuidebotStuckReturn.cs" />
     <Compile Include="GuidebotAutoExit.cs" />
+    <Compile Include="SwitchRotateOnce.cs" />
     <Compile Include="JoystickCurveEditor.cs" />
     <Compile Include="JoystickRotationFix.cs" />
     <Compile Include="LevelError.cs" />
