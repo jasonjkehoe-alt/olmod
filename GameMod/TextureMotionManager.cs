@@ -52,7 +52,20 @@ namespace GameMod
     // _EmissionMap is the SAME texture object as _MainTex (datapani /
     // bright antennas in Step 3) — then its offset is scrolled too.
     // EnergyCenter1's _EmissionMap is black (__d3_black_clear), so Step 1
-    // scrolls _MainTex only.
+    // scrolled _MainTex only — and the panel rendered dull (lit only by
+    // the room), not glowing.
+    //
+    // Glow (Step 1b, Nov 20): the panel is an energy center — it must
+    // GLOW bright yellow. Standard-shader emission is _EmissionColor x
+    // _EmissionMap, so setting the color alone would emit black x color
+    // = black. Scan() therefore ALSO repoints _EmissionMap at _MainTex
+    // (the barcode itself): the yellow bars emit, the dark bars stay
+    // dark, and because _EmissionMap is now _MainTex, scrollEmission
+    // goes true and the glow scrolls in sync with the albedo. The color
+    // is HDR (2.0, 1.5, 0.25) — bright warm yellow, above room light.
+    // Set ONCE in Scan() at level start, never per frame. Scoping is the
+    // same as the scroll: per-renderer material instances matched by
+    // texture name, so other om_signs_01a signs are untouched.
     //
     // Rate: slide_v (UV/s) from table.gam, exactly as authored in D3.
     // EnergyCenter1: slide_u=0, slide_v=1.0, speed=1.0 — the panel
@@ -81,6 +94,11 @@ namespace GameMod
     public static class TextureMotionManager
     {
         private const string kManagerObjectName = "TextureMotionManager";
+
+        // Glow (Step 1b): bright warm yellow, HDR — base yellow
+        // (1.0, 0.75, 0.125) x intensity 2.0. Reads as live energy,
+        // above the room lighting. Only applied to matched materials.
+        private static readonly Color kGlowColor = new Color(2.0f, 1.5f, 0.25f);
 
         // One entry from <level>-texturemotion.txt.
         public class Entry
@@ -179,6 +197,31 @@ namespace GameMod
             return entries;
         }
 
+        // Make a matched material glow: repoint _EmissionMap at _MainTex
+        // (the barcode itself — the stock map is black, and black x any
+        // _EmissionColor emits nothing) and set a bright yellow-orange
+        // _EmissionColor. Called ONCE per material at scan time, never
+        // per frame. Returns true if the glow was applied. Fail-open:
+        // any missing property or exception leaves the material
+        // still scrolling, just not glowing.
+        private static bool ApplyGlow(Material m)
+        {
+            try
+            {
+                if (!m.HasProperty("_EmissionMap") || !m.HasProperty("_EmissionColor"))
+                    return false;
+                m.SetTexture("_EmissionMap", m.mainTexture);
+                m.SetColor("_EmissionColor", kGlowColor);
+                m.EnableKeyword("_EMISSION");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[TextureMotion] glow failed for '" + m.name + "': " + ex.Message);
+                return false;
+            }
+        }
+
         private static List<ScrollingMaterial> Scan(List<Entry> entries)
         {
             List<ScrollingMaterial> outList = new List<ScrollingMaterial>();
@@ -202,6 +245,14 @@ namespace GameMod
                     {
                         if (string.Equals(texName, e.name, StringComparison.OrdinalIgnoreCase))
                         {
+                            // Glow (Step 1b): make the panel emit. MUST run
+                            // BEFORE scrollEmission is computed below —
+                            // repointing _EmissionMap at _MainTex makes
+                            // scrollEmission true, so the glow scrolls in
+                            // sync with the albedo. Fail-open: if the
+                            // material has no emission properties, the
+                            // panel still scrolls, it just does not glow.
+                            bool glowing = ApplyGlow(m);
                             ScrollingMaterial sm = new ScrollingMaterial();
                             sm.material = m;
                             sm.slideU = e.slideU;
@@ -209,7 +260,7 @@ namespace GameMod
                             sm.scrollEmission = m.HasProperty("_EmissionMap") && m.GetTexture("_EmissionMap") == m.mainTexture;
                             outList.Add(sm);
                             seen.Add(m);
-                            Debug.Log("[TextureMotion] scrolling '" + texName + "' (material '" + m.name + "'): slide_u=" + e.slideU + ", slide_v=" + e.slideV + ", speed=" + e.speed + (sm.scrollEmission ? " (+_EmissionMap)" : ""));
+                            Debug.Log("[TextureMotion] scrolling '" + texName + "' (material '" + m.name + "'): slide_u=" + e.slideU + ", slide_v=" + e.slideV + ", speed=" + e.speed + (sm.scrollEmission ? " (+_EmissionMap)" : "") + (glowing ? " (+glow)" : " (no glow)"));
                             break;
                         }
                     }
