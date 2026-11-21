@@ -39,14 +39,24 @@ namespace GameMod
     // in one scene), the old one is destroyed first, so the scan is
     // idempotent.
     //
-    // Materials: per-renderer instances (renderer.materials), NOT the
-    // shared material — the level materials are stock poc materials
-    // shared across levels, and scrolling a sharedMaterial would leave a
-    // shifted offset behind for the next level. Per-renderer instances
-    // die with the scene. The list is captured ONCE at scan time;
-    // Update() only touches the stored Material references (never
-    // re-queries renderer.materials, which would instantiate a new copy
-    // per frame).
+    // Materials: per-renderer instances, NOT the shared material — the
+    // level materials are stock poc materials shared across levels, and
+    // scrolling a sharedMaterial would leave a shifted offset behind for
+    // the next level. Per-renderer instances die with the scene. The list
+    // is captured ONCE at scan time; Update() only touches the stored
+    // Material references (never re-queries materials, which would
+    // instantiate a new copy per frame).
+    //
+    // Scan scope (FIX Nov 21 — see Scan): the scan READS
+    // renderer.sharedMaterials only (no instantiation). It instantiates
+    // ONLY a material whose texture matches an entry, by hand
+    // (new Material), installed via sharedMaterials with the stock name
+    // preserved — every other renderer in the scene is left exactly as
+    // loaded. The old code read renderer.materials on EVERY renderer,
+    // which instantiated a copy of every material in the level and
+    // renamed each "X (Instance)" — that silently broke Overload's own
+    // exact-name glow-material swaps (PropEmLight, TimedSwitch, etc.),
+    // which is what broke the Falcon and the key room (bisect Nov 21).
     //
     // Emission: only _MainTex is scrolled, unless the material's
     // _EmissionMap is the SAME texture object as _MainTex (datapani /
@@ -222,29 +232,84 @@ namespace GameMod
             }
         }
 
+        // FIX (Nov 21, 2026 — bisect: Step 1 clean, Step 2 broken):
+        // Scan() used to read r.materials on EVERY renderer in the scene.
+        // In Unity, Renderer.materials INSTANTIATES a copy of every
+        // material on the renderer and renames each copy "X (Instance)" —
+        // so one scan silently renamed every material in the level, and
+        // the live Step 2 log proves it: the matched material printed as
+        // 'om_signs_01a (Instance)'. Overload's own code then breaks two
+        // ways (decompile: Assembly-CSharp, Unity 2017.4.10f1):
+        // (1) the glow-dupe pattern — AlienPower, AlienSecretDoor,
+        // AlienWarp, PropEmLight, PropMonitor, PropReactorTurret,
+        // TimedSwitch, RobotMatcen — matches materials by EXACT name in
+        // Start() (which runs AFTER this StartLevel postfix):
+        // sharedMaterials[k].name == m_glow_materials[j].name.
+        // "X (Instance)" never equals "X", so the animated glow
+        // materials are never installed and the game's per-frame emission
+        // writes go to orphaned dupes no renderer uses — the level's
+        // light fixtures, switches, monitors, forcefields and matcens
+        // lose their bright emission and the level renders dark/flat
+        // (the key room reads as "nothingness"); (2) dupes installed in
+        // Awake(), before this postfix (Forcefield, SimpleShield — the
+        // shield pickup in the secret pit), are orphaned the other way:
+        // Scan copies the dupe, the game keeps writing hit-flash to the
+        // original dupe, the renderer shows the frozen copy. The missile
+        // spawns after StartLevel, so Scan never touches it directly —
+        // it breaks through this shared-material side effect. The fix
+        // scans r.sharedMaterials (read-only: no instantiation, no
+        // renaming — the same pattern Console.cs already uses) and
+        // instantiates ONLY the matched material, by hand (new Material),
+        // installed via sharedMaterials so the stock name is preserved
+        // (set explicitly — no " (Instance)" suffix) and any later
+        // name-based game code still matches. Every other renderer is
+        // left exactly as loaded. NOTE for later steps: if an entry ever
+        // matches a material a glow script manages, the instance wraps
+        // that script's dupe — the scroll still works, but if the script
+        // later replaces the instance with its own dupe, scrolling stops
+        // for that renderer (not the case for energycenter1: the panel
+        // renderer has no glow script).
         private static List<ScrollingMaterial> Scan(List<Entry> entries)
         {
             List<ScrollingMaterial> outList = new List<ScrollingMaterial>();
-            HashSet<Material> seen = new HashSet<Material>();
+            // Marker string (checked by the verifier): this build scans
+            // sharedMaterials only and never touches r.materials.
+            Debug.Log("[TextureMotion] scan mode: sharedMaterials-only (fix Nov 21: no r.materials instantiation)");
             Renderer[] renderers = UnityEngine.Object.FindObjectsOfType<Renderer>();
             foreach (Renderer r in renderers)
             {
                 if (r == null)
                     continue;
-                Material[] mats = r.materials; // per-renderer instances (not shared)
-                foreach (Material m in mats)
+                // Read-only: sharedMaterials does NOT instantiate (unlike
+                // r.materials) — non-matching renderers are untouched.
+                Material[] shared = r.sharedMaterials;
+                for (int i = 0; i < shared.Length; i++)
                 {
-                    if (m == null || m.mainTexture == null)
+                    Material sharedMat = shared[i];
+                    if (sharedMat == null || sharedMat.mainTexture == null)
                         continue;
-                    if (seen.Contains(m))
-                        continue;
-                    string texName = m.mainTexture.name;
+                    string texName = sharedMat.mainTexture.name;
                     if (string.IsNullOrEmpty(texName))
                         continue;
                     foreach (Entry e in entries)
                     {
                         if (string.Equals(texName, e.name, StringComparison.OrdinalIgnoreCase))
                         {
+                            // Instantiate ONLY this one matched material.
+                            // new Material() copies the properties; the
+                            // name is set explicitly so it stays the stock
+                            // name (no " (Instance)" suffix). Installing
+                            // via sharedMaterials is the game's own idiom
+                            // (see DuplicateGlowMaterials) — later
+                            // name-based game code still matches.
+                            // (A shared material on several renderers gets
+                            // one instance per renderer, each scrolling —
+                            // that is the correct behaviour.)
+                            Material m = new Material(sharedMat);
+                            m.name = sharedMat.name;
+                            Material[] arr = r.sharedMaterials;
+                            arr[i] = m;
+                            r.sharedMaterials = arr;
                             // Glow (Step 1b): make the panel emit. MUST run
                             // BEFORE scrollEmission is computed below —
                             // repointing _EmissionMap at _MainTex makes
@@ -259,7 +324,6 @@ namespace GameMod
                             sm.slideV = e.slideV;
                             sm.scrollEmission = m.HasProperty("_EmissionMap") && m.GetTexture("_EmissionMap") == m.mainTexture;
                             outList.Add(sm);
-                            seen.Add(m);
                             Debug.Log("[TextureMotion] scrolling '" + texName + "' (material '" + m.name + "'): slide_u=" + e.slideU + ", slide_v=" + e.slideV + ", speed=" + e.speed + (sm.scrollEmission ? " (+_EmissionMap)" : "") + (glowing ? " (+glow)" : " (no glow)"));
                             break;
                         }
