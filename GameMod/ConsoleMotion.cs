@@ -162,6 +162,18 @@ namespace GameMod
         // to change.)
         private static readonly Color kSteadyEmission = new Color(1.0f, 0.8f, 0.5f);
         private static readonly Color kTouchEmission = new Color(1.5f, 0.35f, 0.10f);
+        // Steady light: the touch state is bright because ConsoleMotion
+        // creates a real PointLight; the steady glow was emission-only
+        // on a mid-grey texture, so no emission value could light the
+        // console (investigation Nov 22, console-glow-why-dark.md).
+        // A dim steady PointLight (same position/colour/range as the
+        // touch light, intensity 0.5 vs the touch 1.5) lights the
+        // dome/base/panels and the floor, and makes the cyan
+        // "LOGON..." screen read clearly. One-line change if Jason
+        // wants it brighter/dimmer. Do NOT raise kSteadyEmission
+        // again -- the value was never the lever.
+        private const float kSteadyLightIntensity = 0.5f;
+        internal const string kSteadyLightName = "console_steady_light";
 
         // Carrier instance ID -> installed glow material instances.
         private static readonly Dictionary<int, List<Material>> s_glowByCarrier = new Dictionary<int, List<Material>>();
@@ -212,12 +224,52 @@ namespace GameMod
                     s_glowByCarrier[id] = installed;
                     consoles++;
                     Debug.Log("[ConsoleGlow] steady glow on console at " + carrier.position + " (" + installed.Count + " material(s))");
+                    ApplySteadyLight(carrier);
                 }
             }
             if (consoles == 0)
                 Debug.Log("[ConsoleGlow] no consoles found for steady glow.");
             else
                 Debug.Log("[ConsoleGlow] steady glow applied to " + consoles + " console(s), " + materials + " material(s).");
+        }
+
+        // Steady PointLight: the same runtime light the touch uses
+        // (ConsoleMotion), but dim (0.5) and on from level start.
+        // Child of the carrier so it moves with the console. If a
+        // steady light is already present (level reloaded / called
+        // twice), reuse it instead of creating a second one.
+        // Fail-open: a light failure logs and the console still works.
+        private static void ApplySteadyLight(Transform carrier)
+        {
+            try
+            {
+                if (carrier == null)
+                    return;
+                Transform existing = carrier.Find(kSteadyLightName);
+                if (existing != null)
+                {
+                    Light existingLight = existing.GetComponent<Light>();
+                    if (existingLight != null)
+                    {
+                        existingLight.intensity = kSteadyLightIntensity;
+                        Debug.Log("[ConsoleGlow] steady light already on console at " + carrier.position + " (intensity " + kSteadyLightIntensity + ").");
+                        return;
+                    }
+                }
+                GameObject lightGO = new GameObject(kSteadyLightName);
+                lightGO.transform.SetParent(carrier, false);
+                lightGO.transform.localPosition = ConsoleMotion.kLightLocalPos;
+                Light light = lightGO.AddComponent<Light>();
+                light.type = LightType.Point;
+                light.color = ConsoleMotion.kLightColor;
+                light.range = ConsoleMotion.kLightRange;
+                light.intensity = kSteadyLightIntensity;
+                Debug.Log("[ConsoleGlow] steady light on console at " + carrier.position + " (intensity " + kSteadyLightIntensity + ").");
+            }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[ConsoleGlow] steady light failed: " + ex.ToString());
+            }
         }
 
         public static void BoostOnTouch(Transform carrier)
@@ -257,9 +309,9 @@ namespace GameMod
         private const float kDuration = 4.0f;
         private const float kLightRampTime = 0.5f;
         private const float kLightIntensity = 1.5f;
-        private const float kLightRange = 6.0f;
-        private static readonly Color kLightColor = new Color(1.0f, 0.95f, 0.85f);
-        private static readonly Vector3 kLightLocalPos = new Vector3(0f, 0.5f, 1.0f);
+        internal const float kLightRange = 6.0f;
+        internal static readonly Color kLightColor = new Color(1.0f, 0.95f, 0.85f);
+        internal static readonly Vector3 kLightLocalPos = new Vector3(0f, 0.5f, 1.0f);
         // D3 flip axis (RANI sm3/sm4): (0, 0.3746, 0.9272), normalized.
         private static readonly Vector3 kFlipAxis = new Vector3(0f, 0.3746f, 0.9272f).normalized;
         private static readonly Vector3 kTiltAxis = Vector3.right; // sm1: +X
@@ -303,6 +355,7 @@ namespace GameMod
         private Transform m_sm1, m_sm2, m_sm3, m_sm4;
         private Vector3 m_sm1Base, m_sm2Base, m_sm3Base, m_sm4Base;
         private Light m_light;
+        private float m_lightStartIntensity;
         private float m_time;
 
         void Start()
@@ -326,17 +379,40 @@ namespace GameMod
                 // The light: a runtime PointLight, child of the carrier
                 // root, above the arm and 1 m out (local +Z is the arm
                 // direction; local Y is ~world up). Warm white, range
-                // 6 m, ramps 0 -> 1.5 over the first 0.5 s (as the handle
+                // 6 m, ramps to 1.5 over the first 0.5 s (as the handle
                 // tilts up), then holds full. No .sp change — the light
                 // is created here, at trigger time.
-                GameObject lightGO = new GameObject("console_light");
-                lightGO.transform.SetParent(transform, false);
-                lightGO.transform.localPosition = kLightLocalPos;
-                m_light = lightGO.AddComponent<Light>();
-                m_light.type = LightType.Point;
-                m_light.color = kLightColor;
-                m_light.range = kLightRange;
-                m_light.intensity = 0f;
+                //
+                // Reuse the steady light if ApplySteadyGlow already
+                // created one (console_steady_light, intensity 0.5 from
+                // level start): raise THAT light to 1.5 instead of
+                // creating a second PointLight. The ramp starts from
+                // the light's current intensity, so a steady light
+                // brightens 0.5 -> 1.5 with no dip. If no steady light
+                // exists (console added after level start), create
+                // console_light as before.
+                Transform steady = transform.Find(ConsoleGlow.kSteadyLightName);
+                if (steady != null)
+                {
+                    m_light = steady.GetComponent<Light>();
+                    if (m_light != null)
+                    {
+                        m_lightStartIntensity = m_light.intensity;
+                        Debug.Log("[ConsoleMotion] reusing steady light on console at " + transform.position + " (raising " + m_lightStartIntensity + " -> " + kLightIntensity + ").");
+                    }
+                }
+                if (m_light == null)
+                {
+                    GameObject lightGO = new GameObject("console_light");
+                    lightGO.transform.SetParent(transform, false);
+                    lightGO.transform.localPosition = kLightLocalPos;
+                    m_light = lightGO.AddComponent<Light>();
+                    m_light.type = LightType.Point;
+                    m_light.color = kLightColor;
+                    m_light.range = kLightRange;
+                    m_light.intensity = 0f;
+                    m_lightStartIntensity = 0f;
+                }
                 m_time = 0f;
             }
             catch (System.Exception ex)
@@ -364,9 +440,12 @@ namespace GameMod
                 m_sm2.localPosition = m_sm2Base + SampleVector3(kSm2PosTimes, kSm2PosOffsets, t);
                 m_sm3.localPosition = m_sm3Base + SampleVector3(kSm3PosTimes, kSm3PosOffsets, t);
                 m_sm4.localPosition = m_sm4Base + SampleVector3(kSm4PosTimes, kSm4PosOffsets, t);
-                // Light ramps 0 -> full over the first 0.5 s, then holds.
+                // Light ramps from its starting intensity to full over
+                // the first 0.5 s, then holds. A fresh light ramps
+                // 0 -> 1.5; a reused steady light ramps 0.5 -> 1.5
+                // (no dip).
                 if (m_light != null)
-                    m_light.intensity = kLightIntensity * Mathf.Clamp01(t / kLightRampTime);
+                    m_light.intensity = Mathf.Lerp(m_lightStartIntensity, kLightIntensity, Mathf.Clamp01(t / kLightRampTime));
                 if (m_time >= kDuration)
                 {
                     // Latched: the transforms keep their final values.
