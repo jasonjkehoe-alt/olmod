@@ -59,8 +59,55 @@ namespace GameMod
     //   GUIDEBOT_CROSSINGS
     //   1
     //   DOORWAY <from> <to> <cx> <cy> <cz> <near> <far>
+    //       [<n_appr> <ax> <ay> <az> ...]   (optional approach
+    //       waypoints, staging points on the FROM side in from->to
+    //       order, played before the crossing; no suffix = the
+    //       original single-point doorway)
     //   RIDGE <z_min> <z_max> <climb_y> <n_wp> <n_legs> <leg_from> <leg_to> ...
     //   <wp_x> <wp_y> <wp_z>        (n_wp lines, in route order)
+    //
+    // Spawn-exit fix (Nov 22) -- the e3e42ff9 flight shows the bot
+    // stalls IN the spawn room even with a stable goal (166 kept-path
+    // events in seg 217, index 0->1, never past 1; 87 in seg 216,
+    // index never leaves 0). Three parts, all in this file:
+    //   (A) Doorway waypoint SEQUENCE: the 217->213 portal-centre aim
+    //       is blocked from ~60% of seg 217 by a slanted D3 wall face
+    //       (centre line only +0.108 m clear at the 0.60 m collider);
+    //       the validated crossing is 2.67 m north of the portal
+    //       centre (392.63, 54.81, 444.42, +0.784), reached via the
+    //       approach waypoint 217 centre (399.62, 54.81, 441.75,
+    //       +1.745). The table carries the approach on the DOORWAY
+    //       line (see above); TryDoorwayDestination plays the
+    //       sequence (approach, then crossing; reversed for the return
+    //       leg) reusing the TryRidgeDestination / IsPassed /
+    //       forward-guard pattern.
+    //   (B) Stale m_target_is_portal reset: InitPath sets the
+    //       destination to the bot's own segment centre but never
+    //       resets the flag, so after a goal flip the stock advance
+    //       can never fire (the 216 stall). A postfix on
+    //       Robot.CreatePathToSegment resets it -- but ONLY when the
+    //       original actually ran (see the guard note on the postfix
+    //       class: Harmony postfixes run even when the original was
+    //       skipped, and clearing the flag mid-path would defeat the
+    //       stock portal-advance gate).
+    //   (C) Off-route resync target best+1 -> best (defense-in-depth):
+    //       the stock match fires as soon as the bot enters
+    //       Global_path[best] and sets the destination.
+    //
+    // TO_GOAL HOLD -- TEST-FLIGHT SETTING, NOT A HARD RULE (Jason,
+    // Nov 22, for the next test flight ONLY): he agreed the bot
+    // should hold TO_GOAL en route for the next test flight -- go for
+    // the goal, don't worry about him -- so Fixes A-C can be judged
+    // on a clean run. He explicitly said this is NOT a hard rule --
+    // he is just talking it through, not making permanent rules, and
+    // the follow behavior is to be revisited later. So the hold is a
+    // clearly-marked, reversible test configuration (the
+    // kHoldGuidebotToGoal_TestFlight flag on the GuideBotLeadPlayer
+    // patch class, default ON for this test flight): it only
+    // neutralises the TO_GOAL -> TO_PLAYER flip condition for one
+    // call and restores the inputs afterwards. The TO_PLAYER path is
+    // NOT deleted -- flip the flag to false (and rebuild) and the
+    // stock following runs unchanged.
     //
     // Step 2 (Nov 22) -- route-position resync: the Step 1 flight log
     // proves Global_path_index NEVER advances (stuck at 0/1 the whole
@@ -147,6 +194,11 @@ namespace GameMod
             public int From;
             public int To;
             public Vector3 Crossing;
+            // Optional approach waypoints: staging points on the FROM
+            // side, in from->to order, played before the crossing
+            // (spawn-exit fix, Nov 22). Empty = the original
+            // single-point doorway (42<->807).
+            public List<Vector3> Approach = new List<Vector3>();
         }
 
         private class RidgeLeg
@@ -223,15 +275,26 @@ namespace GameMod
             }
 
             // ---- doorway: leg match, either direction ----
+            // Spawn-exit fix (Nov 22): a waypoint SEQUENCE, not a
+            // single fixed point -- aim at the next unpassed waypoint
+            // (approach, then crossing; reversed for the return leg),
+            // reusing the TryRidgeDestination / IsPassed /
+            // forward-guard pattern. A leg match with all waypoints
+            // passed falls through to the ridge check, then to stock.
             foreach (var dw in table.Doorways)
             {
-                if ((fromSeg == dw.From && toSeg == dw.To) ||
-                    (fromSeg == dw.To && toSeg == dw.From))
+                bool fwd = (fromSeg == dw.From && toSeg == dw.To);
+                bool rev = (fromSeg == dw.To && toSeg == dw.From);
+                if (!fwd && !rev)
+                    continue;
+                Vector3 dest;
+                string kind;
+                if (TryDoorwayDestination(dw, fwd, botPos, out dest, out kind))
                 {
-                    SetDestination(__instance, dw.Crossing,
-                        "doorway " + fromSeg + "->" + toSeg);
+                    SetDestination(__instance, dest, kind + " " + fromSeg + "->" + toSeg);
                     return;
                 }
+                break; // leg matched, waypoints exhausted: stock resumes
             }
 
             // ---- ridge: position-based band (applies even if the path
@@ -304,11 +367,16 @@ namespace GameMod
                 // (b) Bot's segment is NOT on the route (off-route, e.g.
                 // seg 1470 in the ridge climb -- not on the route, not
                 // portal-connected): fall back to the NEAREST route
-                // segment by centre distance, and aim at the next one
-                // after it. In the ridge band this lands on seg 804
-                // (the route segment after the ridge): the bot at the
-                // climb waypoint is nearest to 43's centre, so the
-                // index jumps to 804. Segment centres come from the
+                // segment by centre distance, and aim AT it (spawn-exit
+                // fix, Nov 22: the old best+1 target skipped the
+                // nearest route segment the bot has not entered -- the
+                // same structural flaw the on-route branch had before
+                // e3e42ff9. With best, the stock match fires as soon
+                // as the bot enters Global_path[best] and the
+                // destination is set). In the ridge band this lands on
+                // seg 804 (the route segment after the ridge): the bot
+                // at the climb waypoint is nearest to 43's centre, so
+                // the index jumps to 804. Segment centres come from the
                 // level data (GameManager.m_level_data.Segments[].Center,
                 // the same source DoPathFollowPreDefined uses via
                 // m_levelData) -- no crossings-table data is involved.
@@ -329,7 +397,8 @@ namespace GameMod
                 }
                 if (best < 0)
                     return;
-                int target2 = best + 1;
+                // Spawn-exit fix (Nov 22): target best, NOT best+1.
+                int target2 = best;
                 if (target2 > len - 1)
                     target2 = len - 1;
                 if (target2 > idx)
@@ -397,6 +466,68 @@ namespace GameMod
                     float s = forward ? 1f : -1f;
                     dest = botPos + dir * (8f * s);
                     dest.y = rg.ClimbY;
+                }
+                return true;
+            }
+            // Past all waypoints: resume stock pathing.
+            return false;
+        }
+
+        // Doorway waypoint sequence (spawn-exit fix, Nov 22): the same
+        // pattern as TryRidgeDestination, over the doorway's waypoint
+        // list (approach waypoints in from->to order, crossing last).
+        // Forward (leg From->To) plays the list in order; reverse
+        // (leg To->From) plays it reversed, so the crossing comes
+        // first and the approach points trail behind it. No approach
+        // waypoints = the original single-point doorway (the list is
+        // just [crossing]). The forward guard pushes 8 m ahead along
+        // the route direction at the waypoint's own height (the ridge
+        // guard pushes at ClimbY; doorway waypoints carry their own
+        // y). Returns false once the bot is past every waypoint, so
+        // normal pathing resumes. `kind` names the waypoint for the
+        // log: "doorway-approach" or "doorway-crossing".
+        static bool TryDoorwayDestination(DoorwayEntry dw, bool forward,
+            Vector3 botPos, out Vector3 dest, out string kind)
+        {
+            dest = Vector3.zero;
+            kind = null;
+            // Ordered waypoint list, from->to (approach, then crossing).
+            var seq = new List<Vector3>(dw.Approach);
+            seq.Add(dw.Crossing);
+            if (seq.Count == 0)
+                return false;
+
+            // Route direction (horizontal) from first to last waypoint.
+            Vector3 first = seq[0];
+            Vector3 last = seq[seq.Count - 1];
+            Vector3 dir = new Vector3(last.x - first.x, 0f, last.z - first.z);
+            if (dir.sqrMagnitude < 1e-6f)
+            {
+                // Degenerate (single point, or approach == crossing):
+                // aim at the crossing directly.
+                dest = dw.Crossing;
+                kind = "doorway-crossing";
+                return true;
+            }
+            dir.Normalize();
+
+            // Next unpassed waypoint in travel order.
+            for (int i = 0; i < seq.Count; i++)
+            {
+                int k = forward ? i : (seq.Count - 1 - i);
+                Vector3 wp = seq[k];
+                if (IsPassed(wp, botPos, dir, forward))
+                    continue;
+                dest = wp;
+                kind = (wp == dw.Crossing) ? "doorway-crossing" : "doorway-approach";
+                // Forward guard: never aim behind the bot along the
+                // route direction (prevents turning back / hovering).
+                float ahead = Vector3.Dot(dest - botPos, dir) * (forward ? 1f : -1f);
+                if (ahead <= 0f)
+                {
+                    float s = forward ? 1f : -1f;
+                    dest = botPos + dir * (8f * s);
+                    dest.y = wp.y;
                 }
                 return true;
             }
@@ -518,6 +649,11 @@ namespace GameMod
                 if (t[0] == "DOORWAY")
                 {
                     // DOORWAY <from> <to> <cx> <cy> <cz> <near> <far>
+                    //   [<n_appr> <ax> <ay> <az> ...]
+                    // The optional approach suffix (spawn-exit fix,
+                    // Nov 22) lists staging points on the FROM side,
+                    // in from->to order. No suffix = the original
+                    // single-point doorway (42<->807).
                     if (t.Length < 8)
                     {
                         Debug.Log("[GuidebotSteering] bad DOORWAY line: " + lines[i]);
@@ -533,6 +669,28 @@ namespace GameMod
                         return null;
                     }
                     dw.Crossing = new Vector3(cx, cy, cz);
+                    if (t.Length >= 9)
+                    {
+                        int nAppr;
+                        if (!TryInt(t[8], out nAppr) || nAppr < 0 ||
+                            t.Length < 9 + 3 * nAppr)
+                        {
+                            Debug.Log("[GuidebotSteering] bad DOORWAY approach: " + lines[i]);
+                            return null;
+                        }
+                        for (int k = 0; k < nAppr; k++)
+                        {
+                            float ax, ay, az;
+                            if (!TryFloat(t[9 + 3 * k], out ax) ||
+                                !TryFloat(t[10 + 3 * k], out ay) ||
+                                !TryFloat(t[11 + 3 * k], out az))
+                            {
+                                Debug.Log("[GuidebotSteering] bad DOORWAY approach numbers: " + lines[i]);
+                                return null;
+                            }
+                            dw.Approach.Add(new Vector3(ax, ay, az));
+                        }
+                    }
                     table.Doorways.Add(dw);
                     i++;
                 }
@@ -619,6 +777,16 @@ namespace GameMod
     [HarmonyPatch(typeof(Robot), "CreatePathToSegment")]
     public class Robot_CreatePathToSegment_GuidebotSteering
     {
+        // Set by the prefix on every call: true ONLY when the prefix
+        // skipped the re-create (same goal, bot on path), false when
+        // the original ran (or will run). Read by the Fix B postfix
+        // (Robot_CreatePathToSegment_GuidebotSteering_Postfix, below):
+        // the postfix must reset m_target_is_portal ONLY when a new
+        // path was actually built. Single-threaded game loop, so no
+        // race: prefix -> original-or-skip -> postfix, in that order,
+        // within one call.
+        internal static bool s_createPathSkipped = false;
+
         static bool Prefix(Robot __instance, int end_seg,
             out float actual_distance, ref bool __result)
         {
@@ -627,6 +795,7 @@ namespace GameMod
             // caller sees when the original is skipped (callers ignore
             // it -- GuideBotLeadPlayer uses `out var _`).
             actual_distance = 0f;
+            s_createPathSkipped = false;
             try { return PrefixInner(__instance, end_seg, ref __result); }
             catch (System.Exception ex)
             {
@@ -667,11 +836,87 @@ namespace GameMod
             // is preserved (the resync already points it at/after the
             // bot's position); the caller sees success.
             __result = true;
+            s_createPathSkipped = true;
             Debug.Log("[GuidebotSteering] kept path to " + end_seg +
                 " (bot seg " + cur + " at path pos " + pos +
                 ", index " + __instance.Global_path_index +
                 " preserved) -- skipped CreatePathToSegment re-create (InitPath would reset index to 0)");
             return false;
+        }
+    }
+
+    // Spawn-exit fix, part B (Nov 22): reset the stale
+    // m_target_is_portal flag when a NEW path is built. InitPath
+    // (decompile L101676) sets the destination to the bot's own
+    // segment centre but never resets the flag (it is only set false
+    // at L101706/L101723 and true at L101731, all inside
+    // DoPathFollowPreDefined). If the flag was true from the previous
+    // path -- the bot was aiming at a portal centre when the goal
+    // flipped -- it stays true after the re-create: the bot aims at
+    // its own segment centre *as a portal* and must get within 1 m of
+    // it before the flag clears and the advance can fire. That is the
+    // 216 stall (index never leaves 0 for 87 events in the e3e42ff9
+    // flight). After InitPath the destination IS a segment centre, so
+    // the flag is incoherent -- resetting it corrects an
+    // inconsistency, it does not change intended behaviour.
+    //
+    // WHY THE GUARD (s_createPathSkipped): Harmony postfixes run EVEN
+    // WHEN the original was skipped -- a prefix returning false skips
+    // the original body only; postfixes (and finalizers) are not
+    // affected (Harmony docs: "Postfixes and Finalizers are not
+    // affected"). GuideBotLeadPlayer calls CreatePathToSegment every
+    // FixedUpdate and our prefix skips the re-create most of the time,
+    // so a bare postfix would clear the flag every frame -- including
+    // while the bot is legitimately aiming at a portal centre
+    // mid-path. That would defeat the stock 1 m portal-proximity
+    // gate: DoPathFollowPreDefined would treat the portal destination
+    // as a segment centre and advance the index (and the doorway leg)
+    // before the bot has crossed the portal. So the postfix resets
+    // ONLY when the prefix did NOT skip the re-create, via the flag
+    // the prefix sets. When the prefix skips, accumulated state is
+    // preserved. Fail-open: any exception (including the private
+    // field ever moving) leaves the flag alone and logs.
+    // GuideBot only.
+    [HarmonyPatch(typeof(Robot), "CreatePathToSegment")]
+    public class Robot_CreatePathToSegment_GuidebotSteering_Postfix
+    {
+        // Cached reflection handle for the private flag (decompile
+        // L90080: private bool m_target_is_portal). No public accessor
+        // exists, so reflection with a cached FieldInfo; resolved once.
+        private static System.Reflection.FieldInfo s_portalFlag;
+        private static bool s_portalFlagLookedUp;
+
+        static void Postfix(Robot __instance)
+        {
+            try
+            {
+                if (__instance == null || !__instance.m_is_guide_bot)
+                    return;
+                if (Robot_CreatePathToSegment_GuidebotSteering.s_createPathSkipped)
+                    return; // re-create skipped: preserve accumulated state
+                if (!s_portalFlagLookedUp)
+                {
+                    s_portalFlagLookedUp = true;
+                    s_portalFlag = typeof(Robot).GetField("m_target_is_portal",
+                        System.Reflection.BindingFlags.NonPublic |
+                        System.Reflection.BindingFlags.Instance);
+                    if (s_portalFlag == null)
+                    {
+                        Debug.Log("[GuidebotSteering] CreatePathToSegment postfix: " +
+                            "m_target_is_portal field not found -- reset disabled");
+                    }
+                }
+                if (s_portalFlag == null)
+                    return;
+                s_portalFlag.SetValue(__instance, false);
+                Debug.Log("[GuidebotSteering] CreatePathToSegment postfix: " +
+                    "m_target_is_portal reset (new path built, InitPath " +
+                    "destination is the bot's own segment centre)");
+            }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] CreatePathToSegment postfix failed: " + ex.ToString());
+            }
         }
     }
 
@@ -698,6 +943,98 @@ namespace GameMod
             catch (System.Exception ex)
             {
                 Debug.Log("[GuidebotSteering] DoPathFollow postfix failed: " + ex.ToString());
+            }
+        }
+    }
+
+    // TO_GOAL HOLD -- TEST-FLIGHT SETTING, NOT A HARD RULE (Jason,
+    // Nov 22, for the next test flight ONLY -- he explicitly said this
+    // is NOT a hard rule, he is just talking it through, and the
+    // follow behavior is to be revisited later).
+    //
+    // What it does: while the flag below is true, the GuideBot holds
+    // TO_GOAL en route -- it goes for the key regardless of where the
+    // player is -- so Fixes A-C can be judged on a clean run. The
+    // stock flip (decompile GuideBotLeadPlayer L92889, TO_GOAL case)
+    // fires when the player is > 30 m away (m_target_dist > 30f) or
+    // invisible for > 0.7 s; this patch neutralises that flip
+    // condition for ONE call at a time and restores the inputs
+    // afterwards. The prefix presents the in-range + visible inputs
+    // the stock code already uses to STAY on TO_GOAL
+    // (m_target_dist = 0, target_visible = 2 -- both public fields,
+    // saved first); the postfix restores the real values before
+    // anything else reads them. The original GuideBotLeadPlayer body
+    // always runs (the prefix returns true on every path) and the
+    // TO_PLAYER path is NOT deleted: flip the flag to false (and
+    // rebuild) and the stock TO_GOAL <-> TO_PLAYER flipping runs
+    // unchanged, including following the player. Single-threaded game
+    // loop: prefix -> original -> postfix, in that order, within one
+    // call, so the static save slots cannot interleave. Fail-open:
+    // any exception runs the original unmodified (and the postfix
+    // restores the saved values, so a fake can never leak past the
+    // call; m_target_dist / target_visible are recomputed every
+    // FixedUpdate anyway).
+    // GuideBot only.
+    [HarmonyPatch(typeof(Robot), "GuideBotLeadPlayer")]
+    public class Robot_GuideBotLeadPlayer_GuidebotSteering
+    {
+        // TEST-FLIGHT SETTING (Nov 22): true = hold TO_GOAL en route
+        // for the next test flight; false = stock follow behavior.
+        // This is a reversible test configuration, NOT a permanent
+        // behavior change. Revisit with Jason before any later flight.
+        private const bool kHoldGuidebotToGoal_TestFlight = true;
+
+        // Save slots for the one-call input neutralisation (see above).
+        private static float s_savedTargetDist;
+        private static int s_savedTargetVisible;
+        private static bool s_holdActive;
+        private static int s_lastHoldGoal = -1;
+
+        static bool Prefix(Robot __instance, int goal_seg)
+        {
+            if (!kHoldGuidebotToGoal_TestFlight || __instance == null ||
+                !__instance.m_is_guide_bot)
+                return true;
+            try
+            {
+                s_savedTargetDist = __instance.m_target_dist;
+                s_savedTargetVisible = __instance.target_visible;
+                s_holdActive = true;
+                __instance.m_target_dist = 0f;
+                __instance.target_visible = 2;
+                if (s_lastHoldGoal != goal_seg)
+                {
+                    s_lastHoldGoal = goal_seg;
+                    Debug.Log("[GuidebotSteering] TO_GOAL hold (test flight): " +
+                        "holding goal " + goal_seg +
+                        ", TO_PLAYER flip suppressed -- reversible test " +
+                        "setting, not a hard rule");
+                }
+                return true;
+            }
+            catch (System.Exception ex)
+            {
+                s_holdActive = false;
+                Debug.Log("[GuidebotSteering] GuideBotLeadPlayer hold prefix failed: " + ex.ToString());
+                return true;
+            }
+        }
+
+        static void Postfix(Robot __instance)
+        {
+            if (!s_holdActive)
+                return;
+            s_holdActive = false;
+            try
+            {
+                if (__instance == null)
+                    return;
+                __instance.m_target_dist = s_savedTargetDist;
+                __instance.target_visible = s_savedTargetVisible;
+            }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] GuideBotLeadPlayer hold postfix failed: " + ex.ToString());
             }
         }
     }
