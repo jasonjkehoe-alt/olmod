@@ -152,7 +152,15 @@ namespace GameMod
     {
         // Steady: warm amber at room level -- the screen reads ON
         // without washing out the texture. Touch: brighter AND redder.
-        private static readonly Color kSteadyEmission = new Color(0.45f, 0.36f, 0.22f);
+        // (Nov 22, route-resync fix: the 0.45/0.36/0.22 steady value
+        // was INVISIBLE in flight -- 7 [ConsoleGlow] lines, consoles
+        // dark until touched -- while the 1.5/0.35/0.10 touch boost
+        // was clearly visible. Raised to 1.0/0.8/0.5 warm amber: a
+        // clearly visible screen-on level, still below the touch
+        // boost's 1.5 peak red. Jason will check what original D3 does
+        // and may correct the colour -- this constant is the one line
+        // to change.)
+        private static readonly Color kSteadyEmission = new Color(1.0f, 0.8f, 0.5f);
         private static readonly Color kTouchEmission = new Color(1.5f, 0.35f, 0.10f);
 
         // Carrier instance ID -> installed glow material instances.

@@ -85,6 +85,40 @@ namespace GameMod
     // are UNCHANGED -- they were correct; the index was the missing
     // piece.
     //
+    // Fix (Nov 22, route-resync fix) -- the resync alone was NOT enough:
+    // the route-resync flight log shows the index keeps resetting to 0
+    // (143 of 189 resyncs went to index 1; max 55 only after StuckReturn
+    // teleports). The reset source, from the decompile (Assembly-CSharp,
+    // game 1.1.1886.0): GuideBotLeadPlayer re-creates the path to the
+    // goal every 3 s (sub_move_timer = 3f, L92942 TO_GOAL /
+    // CreatePathToPlayer L92912) via CreatePathToSegment (L101898),
+    // which calls InitPath (L101919), which sets Global_path_index = 0
+    // (L101676) and m_next_destination_position to
+    // Segments[Global_path[0]].Center (the bot's OWN segment centre).
+    // Every 3 s the route is rebuilt from the bot's current segment, so
+    // the index can never accumulate along a fixed route -- the resync
+    // just sets it to 1 again. Two-part fix, both in this file:
+    //   (1) Robot_CreatePathToSegment_GuidebotSteering (prefix): skip
+    //       the re-creation when the GuideBot already has a valid path
+    //       to the SAME goal and is ON that path. The caller sees
+    //       success (__result = true), so GuideBotLeadPlayer keeps its
+    //       goal and FindSegmentContainingKey still returns 1; the
+    //       destination reset to Global_path[0].Center is overwritten
+    //       the same frame by the DoPathfindMovement prefix. When the
+    //       goal differs, the bot is off the path, or there is no path,
+    //       the original runs and the path is (re)built -- the reset is
+    //       legitimate then, and the resync re-syncs onto the fresh path.
+    //       Logs the skip / re-create decision, naming InitPath as the
+    //       reset source, so the next flight log proves the reset is gone.
+    //   (2) Robot_DoPathFollow_GuidebotSteering (postfix on
+    //       Robot.DoPathFollow): re-run ResyncPathIndex AFTER the stock
+    //       follower, so a reset anywhere in the stock code
+    //       (CreatePathToSegment/InitPath,
+    //       CreatePathToBelievedPlayerPosition, GuidebotChooseWander-
+    //       Segment) cannot stick past the frame it happened in.
+    //       ResyncPathIndex is forward-only, so it never fights the
+    //       stock index advance.
+    //
     // Fail-open: no table, unreadable table, or no matching entry -> the
     // stock destination is used unchanged. Only the GuideBot is affected
     // (m_is_guide_bot gate); every other robot is untouched, as are the
@@ -222,7 +256,10 @@ namespace GameMod
         // bot enters the segment, or skip a segment the bot is already
         // physically beyond. One log line per actual resync, so the next
         // flight log shows whether the index advances.
-        static void ResyncPathIndex(Robot bot)
+        // Internal (not private): the DoPathFollow postfix
+        // (Robot_DoPathFollow_GuidebotSteering, route-resync fix) calls
+        // it after the stock follower runs, to make the resync persistent.
+        internal static void ResyncPathIndex(Robot bot)
         {
             try
             {
@@ -555,6 +592,109 @@ namespace GameMod
                 }
             }
             return table;
+        }
+    }
+
+    // Route-resync fix, part 1 (Nov 22): stop the index reset at its
+    // source. GuideBotLeadPlayer re-creates the path every 3 s via
+    // Robot.CreatePathToSegment -> InitPath -> Global_path_index = 0
+    // (decompile L92942 / L101898 / L101919 / L101676). This prefix
+    // skips that re-creation when the GuideBot already has a valid path
+    // to the SAME goal and is ON it -- the path is still good, so
+    // rebuilding it only throws the accumulated index away. The caller
+    // sees success (__result = true): GuideBotLeadPlayer keeps its goal
+    // (and does not reset the destination to Global_path[0].Center in
+    // a way that survives -- the DoPathfindMovement prefix overwrites
+    // the destination the same frame), and FindSegmentContainingKey
+    // still returns 1 for a key the bot is already routed to. When the
+    // goal differs, the bot is off the path, or there is no path, the
+    // original runs and the path is (re)built -- the reset is legitimate
+    // then, and the resync re-syncs onto the fresh path. Fail-open: any
+    // exception runs the original (stock behaviour). Only the GuideBot
+    // is affected; every other robot returns true immediately.
+    [HarmonyPatch(typeof(Robot), "CreatePathToSegment")]
+    public class Robot_CreatePathToSegment_GuidebotSteering
+    {
+        static bool Prefix(Robot __instance, int end_seg,
+            out float actual_distance, ref bool __result)
+        {
+            // An out parameter must be assigned on every path: the
+            // original overwrites it when it runs; 0 is the value the
+            // caller sees when the original is skipped (callers ignore
+            // it -- GuideBotLeadPlayer uses `out var _`).
+            actual_distance = 0f;
+            try { return PrefixInner(__instance, end_seg, ref __result); }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] CreatePathToSegment prefix failed: " + ex.ToString());
+                return true;
+            }
+        }
+
+        static bool PrefixInner(Robot __instance, int end_seg, ref bool __result)
+        {
+            if (__instance == null || !__instance.m_is_guide_bot)
+                return true;
+            if (__instance.Global_path == null || __instance.Global_path_length <= 0)
+                return true; // No path yet: build it.
+            int len = __instance.Global_path_length;
+            int goal = __instance.Global_path[len - 1];
+            if (end_seg != goal)
+            {
+                Debug.Log("[GuidebotSteering] re-creating path to " + end_seg +
+                    " (goal changed from " + goal + ") -- InitPath will reset index to 0");
+                return true;
+            }
+            int cur = __instance.SegmentIndex;
+            if (cur < 0)
+                return true; // Bot outside the world: let the original handle it.
+            int pos = -1;
+            for (int i = 0; i < len; i++)
+            {
+                if (__instance.Global_path[i] == cur) { pos = i; break; }
+            }
+            if (pos < 0)
+            {
+                Debug.Log("[GuidebotSteering] re-creating path to " + end_seg +
+                    " (bot seg " + cur + " off path) -- InitPath will reset index to 0");
+                return true;
+            }
+            // Valid path to the same goal, bot on it: keep it. The index
+            // is preserved (the resync already points it at/after the
+            // bot's position); the caller sees success.
+            __result = true;
+            Debug.Log("[GuidebotSteering] kept path to " + end_seg +
+                " (bot seg " + cur + " at path pos " + pos +
+                ", index " + __instance.Global_path_index +
+                " preserved) -- skipped CreatePathToSegment re-create (InitPath would reset index to 0)");
+            return false;
+        }
+    }
+
+    // Route-resync fix, part 2 (Nov 22): persistent resync. Re-run
+    // ResyncPathIndex AFTER the stock follower (DoPathFollowPreDefined)
+    // runs, so a Global_path_index reset anywhere in the stock code --
+    // CreatePathToSegment/InitPath, CreatePathToBelievedPlayerPosition,
+    // GuidebotChooseWanderSegment -- cannot stick past the frame it
+    // happened in. ResyncPathIndex is forward-only, so it can only
+    // accelerate an advance the stock code would make, never fight it.
+    // Fail-open: any exception is logged and the stock destination
+    // stands. GuideBot only.
+    [HarmonyPatch(typeof(Robot), "DoPathFollow")]
+    public class Robot_DoPathFollow_GuidebotSteering
+    {
+        static void Postfix(Robot __instance)
+        {
+            try
+            {
+                if (__instance == null || !__instance.m_is_guide_bot)
+                    return;
+                Robot_DoPathfindMovement_GuidebotSteering.ResyncPathIndex(__instance);
+            }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] DoPathFollow postfix failed: " + ex.ToString());
+            }
         }
     }
 }

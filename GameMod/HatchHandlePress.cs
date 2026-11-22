@@ -15,14 +15,27 @@ namespace GameMod
     // SendMessage("ActivateScriptLink") call Destroyable.ExplodeNow uses,
     // swallow the damage.
     //
-    // Identification: the converter gives the handle a Destroyable
-    // (SWITCH, HP 20) but NO m_special_index marker (only mine_31 gets
-    // 31), so the patch identifies it by prefab name (entity_mine_32,
-    // the poc prefab for mine index 32 --
-    // SetupPropAssets.BuildSwitchPrefab) + ExplodeType SWITCH. Every
+    // Identification (CORRECTED Nov 22, route-resync fix): the handle
+    // is the SWITCH Destroyable that is NOT a mine_31 switch -- the
+    // converter marks every mine_31 with m_special_index = 31 and
+    // leaves mine_32 at the default 0, and the deployed .sp (parsed,
+    // 78b6f162) proves the handle is the ONLY SWITCH Destroyable with
+    // m_special_index 0 (the three mine_31 have 31; every other
+    // Destroyable is ALIEN_POD or REACTOR, never SWITCH). This is the
+    // exact complement of SwitchRotateOnce (which fires on
+    // m_special_index == 31), so the two patches never both fire.
+    // The previous build identified the handle by prefab name
+    // (entity_mine_32) -- WRONG: the runtime GameObject name is
+    // entity_prop_n0000_mine for EVERY prop carrier (the .sp
+    // GameObject name, verified by parsing the deployed .sp), so
+    // StartsWith("entity_mine_32") never matched and the patch never
+    // fired (0 [HatchHandlePress] lines in the flight log). Every
     // mine_32 prop IS a hatch handle by definition
     // (HANDLE_SWITCH_MINE_INDEX = 32), so the rule is general, not
     // L1-specific; no converter change and no reconvert were needed.
+    // Every SWITCH intercept is logged (only 4 SWITCH Destroyables
+    // in L1: the 3 mine_31 + the handle) so a silent 0-line flight
+    // log can never happen again.
     //
     // Animation: the "moving" child (the lever, one rigid part -- the
     // same single-"moving"-child prefab as newswitch) translates DOWN
@@ -39,8 +52,9 @@ namespace GameMod
     [HarmonyPatch(typeof(Destroyable), "ApplyDamage")]
     public class Destroyable_ApplyDamage_HatchHandlePress
     {
-        // Poc prefab name for mine index 32 (the hatch handle).
-        private const string kHandlePrefabName = "entity_mine_32";
+        // The mine_31 marker (SwitchRotateOnce.cs). The handle is a
+        // SWITCH whose m_special_index is NOT this value.
+        private const int kMine31SpecialIndex = 31;
         // Press depth: reads clearly on the lever without burying it.
         private const float kPressDistance = 0.18f;
 
@@ -62,13 +76,22 @@ namespace GameMod
         {
             if (__instance == null)
                 return true;
-            // Only the mine_32 hatch handle (prefab name + SWITCH type).
-            // Everything else (mine_31 switches, barrels, grates,
-            // reactors, secret panels) runs the stock method untouched.
-            // (The name check uses StartsWith: Unity appends "(Clone)"
-            // to instantiated prefab names.)
-            if (__instance.m_explode_type != Destroyable.ExplodeType.SWITCH ||
-                !__instance.gameObject.name.StartsWith(kHandlePrefabName))
+            // Log every SWITCH intercept (only 4 SWITCH Destroyables in
+            // L1: the 3 mine_31 + the handle) so the log proves the patch
+            // is live and shows which one was hit. Non-SWITCH
+            // Destroyables (barrels, grates, reactors, panels) are not
+            // logged -- they are numerous and irrelevant here.
+            bool isSwitch = __instance.m_explode_type == Destroyable.ExplodeType.SWITCH;
+            if (isSwitch)
+            {
+                Debug.Log("[HatchHandlePress] SWITCH intercept: m_special_index=" +
+                    __instance.m_special_index + " at " + __instance.transform.position);
+            }
+            // Only the mine_32 hatch handle: a SWITCH that is NOT a
+            // mine_31. Everything else (mine_31 switches -- left to
+            // SwitchRotateOnce -- barrels, grates, reactors, secret
+            // panels) runs the stock method untouched.
+            if (!isSwitch || __instance.m_special_index == kMine31SpecialIndex)
                 return true;
 
             int id = __instance.GetInstanceID();
