@@ -346,6 +346,27 @@ namespace GameMod
         // LogDestination, below).
         private static string s_lastDestLog;
 
+        // Portal-crossing fix (Nov 22), part 4 -- the 803->41 velocity
+        // question. m_collided_robot_stay_count (decompile L89394)
+        // counts frames in contact with another robot (layer 11);
+        // m_collided_stay_count (L89396) counts frames in contact with
+        // level geometry (layer 0/14). Both are private ints, incremented
+        // by OnCollisionStay and reset after 5 contact-free frames
+        // (L97847-97870). Cached FieldInfo, fail-open to -1 (unknown, so
+        // it is distinguishable from 0), same pattern as the portal flag.
+        private static System.Reflection.FieldInfo s_robotStayCount;
+        private static System.Reflection.FieldInfo s_stayCount;
+        private static bool s_stayCountsLookedUp;
+
+        // Stuck-watch throttle (part 4): LogDestination logs on
+        // destination change only, so a bot that is NOT moving but whose
+        // destination is NOT changing (the hold re-asserts the same
+        // point every frame) would go silent. When the bot is nearly
+        // still (< 0.05 m/s) with a destination > 1 m away, log a watch
+        // line at most once per 50 frames (~1 s) with velocity + stay
+        // counts, so a silent stall still leaves evidence.
+        private static int s_lastStuckWatchFrame = -1000000;
+
         static void Prefix(Robot __instance)
         {
             try { PrefixInner(__instance); }
@@ -542,6 +563,73 @@ namespace GameMod
             {
                 Debug.Log("[GuidebotSteering] m_target_is_portal write failed: " + ex.ToString());
             }
+        }
+
+        // Velocity + stay-count readers (portal-crossing fix, Nov 22,
+        // part 4). c_rigidbody is public (decompile L89291); the two
+        // stay counts are private (L89394/L89396) and read by
+        // reflection, fail-open to -1 so "unknown" is distinguishable
+        // from 0. The 803->41 flight stall showed velocity ~0 with no
+        // layer 0/14 contact and no StuckReturn; these fields are what
+        // the next flight's log needs to tell a robot-collision stall
+        // (robot_stay climbing) from a force/damping stall (velocity
+        // ~0, both counts 0).
+        internal static Vector3 GetBotVelocity(Robot bot)
+        {
+            try
+            {
+                if (bot == null || bot.c_rigidbody == null)
+                    return Vector3.zero;
+                return bot.c_rigidbody.velocity;
+            }
+            catch (Exception) { return Vector3.zero; }
+        }
+
+        static void LookupStayCounts()
+        {
+            if (s_stayCountsLookedUp)
+                return;
+            s_stayCountsLookedUp = true;
+            try
+            {
+                s_robotStayCount = typeof(Robot).GetField("m_collided_robot_stay_count",
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Instance);
+                s_stayCount = typeof(Robot).GetField("m_collided_stay_count",
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Instance);
+                if (s_robotStayCount == null || s_stayCount == null)
+                {
+                    Debug.Log("[GuidebotSteering] stay-count field(s) not found -- velocity logging degraded");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] stay-count lookup failed: " + ex.ToString());
+            }
+        }
+
+        static int ReadStayCount(Robot bot, System.Reflection.FieldInfo field)
+        {
+            try
+            {
+                if (field == null)
+                    return -1;
+                return (int)field.GetValue(bot);
+            }
+            catch (Exception) { return -1; }
+        }
+
+        internal static int GetCollidedRobotStayCount(Robot bot)
+        {
+            LookupStayCounts();
+            return ReadStayCount(bot, s_robotStayCount);
+        }
+
+        internal static int GetCollidedStayCount(Robot bot)
+        {
+            LookupStayCounts();
+            return ReadStayCount(bot, s_stayCount);
         }
 
         // True when the segment number is a real segment in the loaded
@@ -870,15 +958,280 @@ namespace GameMod
                     dest.z.ToString("F2", CultureInfo.InvariantCulture) + "|" +
                     (portal ? "portal" : "seg") + "|" + idx + "|" + cur;
                 if (s_lastDestLog == key)
+                {
+                    // Stuck watch (portal-crossing fix, part 4): the
+                    // destination did not change, so no dest line is
+                    // due -- but if the bot is nearly still with a
+                    // destination > 1 m away, it is stalled on a
+                    // constant aim (the hold re-asserting the same
+                    // point), and the log would otherwise go silent.
+                    // Log at most once per 50 frames (~1 s).
+                    Vector3 vel = GetBotVelocity(bot);
+                    if (vel.sqrMagnitude < 0.05f * 0.05f &&
+                        Vector3.Distance(dest, bot.transform.position) > 1.0f &&
+                        Time.frameCount - s_lastStuckWatchFrame >= 50)
+                    {
+                        s_lastStuckWatchFrame = Time.frameCount;
+                        int robotStay = GetCollidedRobotStayCount(bot);
+                        int stay = GetCollidedStayCount(bot);
+                        Debug.Log("[GuidebotSteering] stuck-watch dest " + dest.ToString() +
+                            " (portal=" + portal + ", index=" + idx +
+                            ", seg=" + cur + ") from " + bot.transform.position.ToString() +
+                            " vel " + vel.ToString() + " |v|=" +
+                            vel.magnitude.ToString("F2", CultureInfo.InvariantCulture) +
+                            " robot_stay=" + robotStay + " stay=" + stay);
+                    }
                     return;
+                }
                 s_lastDestLog = key;
+                Vector3 vel2 = GetBotVelocity(bot);
+                int robotStay2 = GetCollidedRobotStayCount(bot);
+                int stay2 = GetCollidedStayCount(bot);
                 Debug.Log("[GuidebotSteering] dest " + dest.ToString() +
                     " (portal=" + portal + ", index=" + idx +
-                    ", seg=" + cur + ") from " + bot.transform.position.ToString());
+                    ", seg=" + cur + ") from " + bot.transform.position.ToString() +
+                    " vel " + vel2.ToString() + " |v|=" +
+                    vel2.magnitude.ToString("F2", CultureInfo.InvariantCulture) +
+                    " robot_stay=" + robotStay2 + " stay=" + stay2);
             }
             catch (Exception ex)
             {
                 Debug.Log("[GuidebotSteering] dest log failed: " + ex.ToString());
+            }
+        }
+
+        // PORTAL-CROSSING FIX (Nov 22): break the portal-centre <->
+        // next-segment-centre limit cycle (E2D820BC flight diagnosis).
+        //
+        // The stock cycle, decoded from the decompile: DoPathFollowPreDefined
+        // (L101683) branch 6 fires when the bot's segment == Global_path[index]
+        // and aims at the portal centre (GetTargetPointFromPortal, L101753)
+        // when the next centre is not visible, flag=true; when the bot comes
+        // within 1.0 m of the portal centre it re-aims at Global_path[index]'s
+        // centre and clears the flag; MaybeAdvanceSegment (L101781) advances
+        // the index every 0.2 s when Global_path[index+1] is merely visible
+        // and sets dest to that segment's centre. The resync (above) pins the
+        // index back, so the destination flips portal centre <-> next centre
+        // every frame and the bot never moves -- and because the two aim
+        // points are ~59 degrees apart at 803->41, the constant-magnitude
+        // AddForce (DoPathfindMovement, L91810) never builds velocity in
+        // either direction. All four E2D820BC stalls share this signature;
+        // the blocker differs per stall (buried centre, doorway jamb,
+        // glass), the cycle is common.
+        //
+        // This runs in the DoPathFollow postfix, after ResyncPathIndex and
+        // before LogDestination, so the log records the overridden
+        // destination. DoPathfindMovement runs before DoPathFollow each
+        // FixedUpdate, so the override set here is the destination the
+        // NEXT movement frame flies toward -- the stock re-aim still fires
+        // inside DoPathFollow, but its destination never survives to a
+        // movement frame. Three cases, all fail-open (any missing data
+        // leaves the stock destination alone):
+        //   A. Doorway hold: the traversing leg is a crossings-table
+        //      DOORWAY entry (1442->1437, 1706->1707, 42->807, 217->213)
+        //      and the stock destination is that leg's portal centre or
+        //      its next segment's centre -- hold the baked crossing
+        //      point until the bot's segment changes. The portal centre
+        //      is buried (1442->1437) or jamb-blocked (1706->1707); the
+        //      next centre is the same buried point. Does NOT fight the
+        //      movement prefix: while the prefix is staging an approach
+        //      waypoint its destination is the approach/crossing, never
+        //      the portal/next centre, so this case only fires once the
+        //      prefix has handed control back.
+        //   B. Cycle-break (non-doorway legs): the destination is the
+        //      next segment's centre, the portal flag is false (the
+        //      <1.0 m re-aim just cleared it), and the bot is within
+        //      1.0 m of the portal centre -- replace the re-aim target
+        //      with a point 1.5 m BEYOND the portal plane along the
+        //      route (portal centre + normalised next-centre-minus-
+        //      portal-centre * 1.5), re-asserted every frame until the
+        //      segment changes. The bot gets a sustained push through
+        //      the plane instead of oscillating. (803->41, and the
+        //      glass-stall signature -- the glass itself is fix #5's
+        //      scope; this only breaks the cycle, it does not make the
+        //      bot pass the pane.)
+        //   C. MaybeAdvance clamp: the destination is a route segment
+        //      at pos+2 or beyond (a visibility advance) while the bot
+        //      is within 3.0 m of a doorway crossing -- clamp the
+        //      destination to the current leg's portal centre (or the
+        //      crossing, when the current leg is itself a doorway
+        //      leg), so the bot stays on the portal line until it is
+        //      through the doorway instead of being pulled to a far
+        //      segment's centre 14 m away (1707: 1322's centre).
+        internal static void HoldPortalLine(Robot bot)
+        {
+            try
+            {
+                if (bot.Global_path == null || bot.Global_path_length <= 0)
+                    return;
+                int len = bot.Global_path_length;
+                int idx = bot.Global_path_index;
+                int cur = bot.m_current_segment;
+                if (cur < 0 || idx < 0 || idx + 1 >= len)
+                    return;
+                int fromSeg = bot.Global_path[idx];
+                int toSeg = bot.Global_path[idx + 1];
+                if (cur != fromSeg)
+                    return;
+                Vector3 botPos = bot.transform.position;
+                Vector3 dest = bot.m_next_destination_position;
+                Vector3 pc;
+                if (!GetPortalCentre(bot, fromSeg, toSeg, out pc))
+                    return;
+                CrossingsTable table = GetTable();
+                DoorwayEntry dw = null;
+                if (table != null)
+                {
+                    foreach (DoorwayEntry e in table.Doorways)
+                    {
+                        if ((e.From == fromSeg && e.To == toSeg) ||
+                            (e.From == toSeg && e.To == fromSeg))
+                        { dw = e; break; }
+                    }
+                }
+                Vector3 toCentre;
+                bool haveToCentre = TryGetSegmentCentre(toSeg, out toCentre);
+                // Case A -- doorway hold.
+                if (dw != null)
+                {
+                    bool atPortal = Vector3.Distance(dest, pc) < 0.5f;
+                    bool atNext = haveToCentre &&
+                        Vector3.Distance(dest, toCentre) < 0.5f;
+                    if (atPortal || atNext)
+                    {
+                        SetDestination(bot, dw.Crossing,
+                            "portal-crossing doorway-hold " + fromSeg + "->" + toSeg);
+                        return;
+                    }
+                    // Else fall through to case C (MaybeAdvance clamp).
+                }
+                else
+                {
+                    // Case B -- cycle-break (non-doorway legs only).
+                    if (haveToCentre &&
+                        Vector3.Distance(dest, toCentre) < 0.5f &&
+                        !GetTargetIsPortal(bot) &&
+                        Vector3.Distance(botPos, pc) < 1.0f)
+                    {
+                        Vector3 dir = toCentre - pc;
+                        if (dir.sqrMagnitude < 1e-6f)
+                            dir = toCentre - botPos;
+                        if (dir.sqrMagnitude < 1e-6f)
+                            return;
+                        dir.Normalize();
+                        SetDestination(bot, pc + dir * 1.5f,
+                            "portal-crossing " + fromSeg + "->" + toSeg);
+                        return;
+                    }
+                }
+                // Case C -- MaybeAdvance clamp (any leg).
+                if (table != null)
+                {
+                    bool nearDoorway = false;
+                    foreach (DoorwayEntry e in table.Doorways)
+                    {
+                        if (Vector3.Distance(botPos, e.Crossing) < 3.0f)
+                        { nearDoorway = true; break; }
+                    }
+                    if (nearDoorway)
+                    {
+                        for (int i = idx + 2; i < len; i++)
+                        {
+                            Vector3 far;
+                            if (!TryGetSegmentCentre(bot.Global_path[i], out far))
+                                continue;
+                            if (Vector3.Distance(dest, far) < 0.5f)
+                            {
+                                Vector3 clampTarget = (dw != null) ? dw.Crossing : pc;
+                                SetDestination(bot, clampTarget,
+                                    "portal-crossing MaybeAdvance clamp " + fromSeg + "->" + toSeg);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] HoldPortalLine failed: " + ex.ToString());
+            }
+        }
+
+        // Segment centre, fail-open (false when the level data is not
+        // there or the segment number is out of range). Same idiom as
+        // IsValidSegment / IsTerrainCube above.
+        static bool TryGetSegmentCentre(int seg, out Vector3 centre)
+        {
+            centre = Vector3.zero;
+            try
+            {
+                LevelData ld = null;
+                try { ld = GameManager.m_level_data; } catch (Exception) { }
+                if (ld == null || ld.Segments == null ||
+                    seg < 0 || seg >= ld.Segments.Length)
+                    return false;
+                centre = ld.Segments[seg].Center;
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
+        // Portal centre (portal-crossing fix, Nov 22): replicate stock
+        // Robot.GetTargetPointFromPortal (decompile L101753), which
+        // returns the centre of the portal shared by two segments: the
+        // first side whose portal index matches a side of the other
+        // segment, averaged over its four vertices
+        // (SegmentData.SideVertexOrder gives the vertex order per side;
+        // LevelData.SegmentVerts holds the world vertices). Returns
+        // false when the two segments share no portal, or when any of
+        // the data is missing -- HoldPortalLine then leaves the stock
+        // destination alone. Fail-open on any exception.
+        static bool GetPortalCentre(Robot bot, int fromSeg, int toSeg, out Vector3 centre)
+        {
+            centre = Vector3.zero;
+            try
+            {
+                LevelData ld = null;
+                try { ld = GameManager.m_level_data; } catch (Exception) { }
+                if (ld == null || ld.Segments == null || ld.SegmentVerts == null)
+                    return false;
+                if (fromSeg < 0 || fromSeg >= ld.Segments.Length ||
+                    toSeg < 0 || toSeg >= ld.Segments.Length)
+                    return false;
+                int[] fromPorts = ld.Segments[fromSeg].Portals;
+                int[] toPorts = ld.Segments[toSeg].Portals;
+                int[] verts = ld.Segments[fromSeg].VertIndices;
+                if (fromPorts == null || toPorts == null || verts == null)
+                    return false;
+                int n = fromPorts.Length < 6 ? fromPorts.Length : 6;
+                int m = toPorts.Length < 6 ? toPorts.Length : 6;
+                for (int i = 0; i < n; i++)
+                {
+                    if (fromPorts[i] < 0)
+                        continue;
+                    for (int j = 0; j < m; j++)
+                    {
+                        if (toPorts[j] < 0)
+                            continue;
+                        if (fromPorts[i] == toPorts[j])
+                        {
+                            Vector3 sum = Vector3.zero;
+                            for (int k = 0; k < 4; k++)
+                            {
+                                int vi = verts[SegmentData.SideVertexOrder[i][k]];
+                                sum += ld.SegmentVerts[vi];
+                            }
+                            centre = sum * 0.25f;
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] GetPortalCentre failed: " + ex.ToString());
+                return false;
             }
         }
 
@@ -1424,6 +1777,11 @@ namespace GameMod
                 if (__instance == null || !__instance.m_is_guide_bot)
                     return;
                 Robot_DoPathfindMovement_GuidebotSteering.ResyncPathIndex(__instance);
+                // Portal-crossing fix (Nov 22): break the portal-centre
+                // <-> next-centre limit cycle and hold doorway crossings,
+                // before the log line -- so the line records the
+                // overridden destination, not the stock flip.
+                Robot_DoPathfindMovement_GuidebotSteering.HoldPortalLine(__instance);
                 // Destination logging (Nov 22, e5a796ff flight): after
                 // the resync, so the line records the destination the
                 // stock follower set for the next frame with the
