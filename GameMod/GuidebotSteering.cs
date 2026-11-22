@@ -175,7 +175,10 @@ namespace GameMod
     //       position on-route (Nov 22 pull-back fix), so a stock
     //       advance past the bot cannot stick past the frame it
     //       happened in either; the off-route branch stays
-    //       forward-only.
+    //       forward-only. (Portal-aware since Nov 22, e5a796ff
+    //       flight: while a portal destination is active the target
+    //       is pos+1 -- see the portal-aware pull-back section
+    //       below.)
     //
     // Ridge-guard + index pull-back (Nov 22) -- the d4491740 flight:
     // the spawn exit WORKED (doorway-approach + doorway-crossing fired,
@@ -213,6 +216,46 @@ namespace GameMod
     //   (best). A routine 1-step pull-back (undoing the stock advance)
     //   is silent; a pull-back of 2+ is logged, so the flight log
     //   shows the runaway being corrected without spamming.
+    //
+    // Portal-aware pull-back (Nov 22) -- the e5a796ff flight: the bot
+    // got to path pos 40/109 (seg 8, the tubes) -- the farthest any
+    // steering build has got it -- then looped 8 -> 789 -> 790 -> 16 ->
+    // 14/16 -> 790 -> 789 -> 8, entering seg 8 nine times and reversing
+    // out every time, never entering 791. Ridge guard worked (0
+    // overrides), the index pull-back worked (max gap 2, pinned to
+    // pos), goal held 752 with zero flips. The stall is a NEW
+    // mechanism, a steering-logic interaction introduced by the
+    // pull-back itself: the pull-back pins Global_path_index to the
+    // bot's own segment (pos), but the stock portal branch
+    // (DoPathFollowPreDefined, decompile L101683-101753) and the
+    // stock stuck-recovery (m_collided_stay_count > 50) both resolve
+    // the destination via Global_path[Global_path_index] ASSUMING the
+    // index points at the NEXT segment. When the bot reaches a portal
+    // point, the destination becomes the bot's OWN segment centre --
+    // 32.77 m BEHIND the 8->791 portal (seg 8's centre is (487.35,
+    // 48.98, 553.61); the portal is at x=520.12) -- instead of 791's
+    // centre, so the bot turns around. Fix: when m_target_is_portal
+    // is true, the pull-back target is pos+1, not pos, preserving
+    // the stock invariant while a portal destination is active. This
+    // is safe against reintroducing the resync-deadlock: in the
+    // portal case the destination is already set (to the portal
+    // centre) before the resync runs, so setting the index to pos+1
+    // does not leave the destination stale -- the bot keeps flying
+    // to the portal centre, and on arrival the portal branch sets
+    // the destination to Global_path[pos+1] centre (forward). When
+    // the flag is false, the target stays pos (the deadlock lesson
+    // still holds: with no portal destination active, pos+1 skips
+    // the match and leaves the destination stale). The flag is
+    // private on Robot (decompile L90080), so it is read via
+    // reflection with a cached FieldInfo, the same pattern as the
+    // Fix B postfix; any reflection failure fails open to the old
+    // behaviour (target pos). Destination logging: the destination
+    // was NOT in the e5a796ff log, so the mechanism had to be
+    // inferred from the decompile + the segment trace + the
+    // geometry. The DoPathFollow postfix now logs the destination
+    // (bot position, m_next_destination_position, m_target_is_portal,
+    // index) whenever it changes, so the next flight's log shows the
+    // destination directly.
     //
     // Fail-open: no table, unreadable table, or no matching entry -> the
     // stock destination is used unchanged. Only the GuideBot is affected
@@ -290,6 +333,18 @@ namespace GameMod
         // 3.8 m from a waypoint, measured from segment centres) and
         // dead everywhere else (nearest spawn segment is 171 m away).
         private const float kRidgeProximity = 30f;
+
+        // Cached reflection handle for the private portal flag
+        // (decompile L90080: private bool m_target_is_portal). No
+        // public accessor exists, so reflection with a cached
+        // FieldInfo, resolved once -- the same pattern as the Fix B
+        // postfix (Robot_CreatePathToSegment_GuidebotSteering_Postfix).
+        private static System.Reflection.FieldInfo s_portalFlag;
+        private static bool s_portalFlagLookedUp;
+
+        // Last destination-log key (change-only throttle for
+        // LogDestination, below).
+        private static string s_lastDestLog;
 
         static void Prefix(Robot __instance)
         {
@@ -412,11 +467,49 @@ namespace GameMod
         // ahead of the bot and the destination sticks at a far
         // segment's blocked centre. Pulling it back to the bot's
         // position makes the stock match fire every frame and
-        // re-derive the destination to the next route segment. The
-        // off-route branch stays forward-only. One log line per actual
+        // re-derive the destination to the next route segment.
+        // Portal-aware (Nov 22, e5a796ff flight): while the bot is
+        // aiming at a portal centre (m_target_is_portal true) the
+        // target is pos+1, not pos -- the stock portal branch and
+        // stuck-recovery assume the index points at the NEXT segment,
+        // and pinning it to pos made the destination the bot's own
+        // segment centre (the tube loop at 8->791). The off-route
+        // branch stays forward-only. One log line per actual
         // resync, so the next flight log shows whether the index
         // advances (a routine 1-step pull-back is silent; a pull-back
         // of 2+ is logged).
+        // Read the stock portal flag (decompile L90080: private bool
+        // m_target_is_portal). True = the bot is aiming at a portal
+        // centre (the destination is a portal point, not a segment
+        // centre). Any reflection failure fails open to false -- the
+        // old pull-back behaviour (target pos) -- so a lookup problem
+        // can never break pathing.
+        internal static bool GetTargetIsPortal(Robot bot)
+        {
+            try
+            {
+                if (!s_portalFlagLookedUp)
+                {
+                    s_portalFlagLookedUp = true;
+                    s_portalFlag = typeof(Robot).GetField("m_target_is_portal",
+                        System.Reflection.BindingFlags.NonPublic |
+                        System.Reflection.BindingFlags.Instance);
+                    if (s_portalFlag == null)
+                    {
+                        Debug.Log("[GuidebotSteering] m_target_is_portal field not found -- portal-aware pull-back disabled");
+                    }
+                }
+                if (s_portalFlag == null)
+                    return false;
+                return (bool)s_portalFlag.GetValue(bot);
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] m_target_is_portal read failed: " + ex.ToString());
+                return false;
+            }
+        }
+
         // Internal (not private): the DoPathFollow postfix
         // (Robot_DoPathFollow_GuidebotSteering, route-resync fix) calls
         // it after the stock follower runs, to make the resync persistent.
@@ -434,7 +527,10 @@ namespace GameMod
                 Vector3 botPos = bot.transform.position;
 
                 // (a) Bot's segment IS on the route: pin the index TO
-                // the bot's position, not past it. The stock
+                // the bot's position, not past it -- UNLESS the bot
+                // is aiming at a portal centre (portal-aware
+                // pull-back, Nov 22, e5a796ff flight: see the
+                // target line below). The stock
                 // DoPathFollowPreDefined advance fires only on
                 // m_current_segment == Global_path[index], and that
                 // advance is what sets the destination (next segment
@@ -451,7 +547,13 @@ namespace GameMod
                 // 110/161 blocked while the next route segments
                 // 850/858 were clear). Pinning the index to pos makes
                 // the match fire every frame and re-derive the
-                // destination to the next route segment.
+                // destination to the next route segment -- except
+                // while a portal destination is active, when the
+                // index must point at the NEXT segment (pos+1), or
+                // the portal branch and the stuck-recovery resolve
+                // the destination to the bot's own segment centre
+                // (the tube loop: nine reversals at the 8->791
+                // portal).
                 int pos = -1;
                 for (int i = 0; i < len; i++)
                 {
@@ -459,7 +561,28 @@ namespace GameMod
                 }
                 if (pos >= 0)
                 {
-                    int target = pos;
+                    // Portal-aware pull-back (Nov 22, e5a796ff
+                    // flight): when the bot is aiming at a portal
+                    // centre (m_target_is_portal true), the target
+                    // is pos+1, not pos. The stock portal branch
+                    // and the stock stuck-recovery resolve the
+                    // destination via Global_path[Global_path_index]
+                    // assuming the index points at the NEXT segment;
+                    // pinning it to pos while a portal destination
+                    // is active makes the destination the bot's OWN
+                    // segment centre -- the tube loop (the bot turned
+                    // around at the 8->791 portal, 32.77 m short of
+                    // the portal, nine times). With the flag true
+                    // the destination is already set (to the portal
+                    // centre) before the resync runs, so pos+1 does
+                    // not leave the destination stale (no
+                    // resync-deadlock): the bot keeps flying to the
+                    // portal centre, and on arrival the portal
+                    // branch sets the destination to
+                    // Global_path[pos+1] centre (forward). When the
+                    // flag is false the target stays pos -- the
+                    // deadlock lesson still holds there.
+                    int target = GetTargetIsPortal(bot) ? pos + 1 : pos;
                     if (target > len - 1)
                         target = len - 1;
                     if (target != idx)
@@ -533,6 +656,46 @@ namespace GameMod
                 // Fail-open: a resync bug must never break pathing --
                 // the stock destination is used unchanged.
                 Debug.Log("[GuidebotSteering] resync failed: " + ex.ToString());
+            }
+        }
+
+        // Log the destination the bot is actually flying toward
+        // (Nov 22, e5a796ff flight): the destination was NOT in the
+        // log, so the tube-loop mechanism had to be inferred from the
+        // decompile + the segment trace + the geometry. This logs the
+        // bot's position, its destination (m_next_destination_position),
+        // m_target_is_portal, and the index -- whenever any of them
+        // changes (change-only throttle, like SetDestination: a steady
+        // flight toward a fixed destination is one line, a flip
+        // between two destinations is a line per flip). Called from
+        // the DoPathFollow postfix (Robot_DoPathFollow_GuidebotSteering),
+        // after ResyncPathIndex, so it records the destination the
+        // stock follower set for the next frame, with the resynced
+        // index. The bot's position is printed for context but is NOT
+        // part of the change key (it moves every frame).
+        // Internal (not private): the DoPathFollow postfix calls it.
+        internal static void LogDestination(Robot bot)
+        {
+            try
+            {
+                Vector3 dest = bot.m_next_destination_position;
+                bool portal = GetTargetIsPortal(bot);
+                int idx = bot.Global_path_index;
+                int cur = bot.m_current_segment;
+                string key = dest.x.ToString("F2", CultureInfo.InvariantCulture) + "," +
+                    dest.y.ToString("F2", CultureInfo.InvariantCulture) + "," +
+                    dest.z.ToString("F2", CultureInfo.InvariantCulture) + "|" +
+                    (portal ? "portal" : "seg") + "|" + idx + "|" + cur;
+                if (s_lastDestLog == key)
+                    return;
+                s_lastDestLog = key;
+                Debug.Log("[GuidebotSteering] dest " + dest.ToString() +
+                    " (portal=" + portal + ", index=" + idx +
+                    ", seg=" + cur + ") from " + bot.transform.position.ToString());
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] dest log failed: " + ex.ToString());
             }
         }
 
@@ -1063,7 +1226,9 @@ namespace GameMod
     // happened in. ResyncPathIndex pulls the index back to the bot's
     // position on-route (Nov 22 pull-back fix), so a stock advance
     // past the bot cannot stick past the frame it happened in either;
-    // the off-route branch stays forward-only.
+    // the off-route branch stays forward-only. It also logs the
+    // destination (LogDestination, Nov 22, e5a796ff flight), so the
+    // next flight's log shows what the bot was flying toward.
     // Fail-open: any exception is logged and the stock destination
     // stands. GuideBot only.
     [HarmonyPatch(typeof(Robot), "DoPathFollow")]
@@ -1076,6 +1241,11 @@ namespace GameMod
                 if (__instance == null || !__instance.m_is_guide_bot)
                     return;
                 Robot_DoPathfindMovement_GuidebotSteering.ResyncPathIndex(__instance);
+                // Destination logging (Nov 22, e5a796ff flight): after
+                // the resync, so the line records the destination the
+                // stock follower set for the next frame with the
+                // resynced index.
+                Robot_DoPathfindMovement_GuidebotSteering.LogDestination(__instance);
             }
             catch (System.Exception ex)
             {
