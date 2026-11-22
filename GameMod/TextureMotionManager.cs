@@ -108,7 +108,7 @@ namespace GameMod
         // Glow (Step 1b): warm yellow — base yellow
         // (1.0, 0.75, 0.125) x intensity 1.0. Reads as live energy,
         // at room-light level. Only applied to matched materials.
-        private static readonly Color kGlowColor = new Color(1.0f, 0.75f, 0.125f);
+        private static readonly Color kGlowColor = new Color(1.5f, 1.125f, 0.1875f);
 
         // One entry from <level>-texturemotion.txt.
         public class Entry
