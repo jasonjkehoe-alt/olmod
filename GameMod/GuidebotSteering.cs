@@ -510,6 +510,177 @@ namespace GameMod
             }
         }
 
+        // Write the stock portal flag (decompile L90080: private bool
+        // m_target_is_portal). Mirrors GetTargetIsPortal: the same
+        // cached FieldInfo, the same fail-open (a lookup problem
+        // leaves the flag alone and logs, so a reflection failure can
+        // never break pathing). Used by the stale-destination repair
+        // (RepairStaleDestination, below), which sets a segment centre
+        // -- not a portal point -- as the destination and must clear
+        // the flag, or the portal branch would resolve the next
+        // destination to the bot's own segment centre (the tube loop).
+        internal static void SetTargetIsPortal(Robot bot, bool value)
+        {
+            try
+            {
+                if (!s_portalFlagLookedUp)
+                {
+                    s_portalFlagLookedUp = true;
+                    s_portalFlag = typeof(Robot).GetField("m_target_is_portal",
+                        System.Reflection.BindingFlags.NonPublic |
+                        System.Reflection.BindingFlags.Instance);
+                    if (s_portalFlag == null)
+                    {
+                        Debug.Log("[GuidebotSteering] m_target_is_portal field not found -- portal-flag write disabled");
+                    }
+                }
+                if (s_portalFlag == null)
+                    return;
+                s_portalFlag.SetValue(bot, value);
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] m_target_is_portal write failed: " + ex.ToString());
+            }
+        }
+
+        // True when the segment number is a real segment in the loaded
+        // level. A failed level-data read fails closed (false): if the
+        // level data is not there, the stock code cannot use the
+        // segment either (FindGoodNearbySegment returns false on a null
+        // level data), so treating it as invalid is consistent.
+        internal static bool IsValidSegment(int seg)
+        {
+            try
+            {
+                LevelData ld = null;
+                try { ld = GameManager.m_level_data; } catch (Exception) { }
+                if (ld == null || ld.Segments == null)
+                    return false;
+                return seg >= 0 && seg < ld.Segments.Length;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        // True when the segment is an outdoor-terrain cube: a 16 x 8 x
+        // 16 m axis-aligned box. Verified on the L1 intermediate
+        // (d3_sp_level01.overload): all 687 terrain_region segments
+        // are exactly (16.0, 8.0, 16.0) and no other segment matches
+        // -- the AABB test is exact for this level, with no
+        // false positives. Uses the segment's AABB corners
+        // (SegmentData.MinCornerPos / MaxCornerPos), the same data
+        // the game uses; no crossings-table or intermediate data is
+        // involved, and no segment number is hardcoded. The GuideBot's
+        // segment lookup is unreliable in these big open cubes
+        // (SegmentIndex can report -1 -- the 7481ae07 flight's
+        // deactivation threw with the bot in the terrain), and the
+        // wander BFS through them is meaningless, so the wander guard
+        // fails open here. A failed level-data read fails open to
+        // false (not a terrain cube): the guard then relies on the
+        // invalid-segment check alone.
+        internal static bool IsTerrainCube(int seg)
+        {
+            try
+            {
+                LevelData ld = null;
+                try { ld = GameManager.m_level_data; } catch (Exception) { }
+                if (ld == null || ld.Segments == null)
+                    return false;
+                if (seg < 0 || seg >= ld.Segments.Length)
+                    return false;
+                Vector3 size = ld.Segments[seg].MaxCornerPos - ld.Segments[seg].MinCornerPos;
+                return size.x >= 15f && size.x <= 17f &&
+                       size.y >= 7f && size.y <= 9f &&
+                       size.z >= 15f && size.z <= 17f;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] terrain-cube check failed: " + ex.ToString());
+                return false;
+            }
+        }
+
+        // Terrain destination re-resolution (Nov 22, 7481ae07 flight).
+        // The trigger: after a kept-path skip, the destination can be
+        // the ROUTE-ORIGIN segment's centre (Global_path[0]).
+        // GuideBotLeadPlayer's TO_GOAL case (decompile L92889) sets
+        // m_next_destination_position =
+        // Segments[Global_path[0]].Center after ANY successful
+        // CreatePathToSegment -- including our kept-path skip, where
+        // the prefix returns __result = true without rebuilding the
+        // path, so InitPath never re-runs and the destination is never
+        // re-derived. In the corridors the stock follower's portal
+        // branch re-resolves it every frame (the bot is within 1 m of
+        // a portal point); in the big open 16 m terrain cubes it is
+        // never near a portal point, so the stale value persists and
+        // the bot flies backward to the origin (7481ae07: seg 26's
+        // centre, 55 m behind the bot at path pos 10, loop
+        // 1437 -> 1442 -> 1381 -> 1387). The repair: if the
+        // destination is the centre of any route segment BEHIND the
+        // bot (Global_path[i], i < pos), re-resolve it forward to the
+        // next route segment's centre (Global_path[pos+1]) and clear
+        // the portal flag (a segment centre, not a portal point).
+        // General: any route origin, any open area -- not hardcoded
+        // to seg 26 or the terrain. The stock follower's next branch-6
+        // match re-derives the destination forward from here, so the
+        // repair only has to break the stale-origin lock for one
+        // frame. Guarded to pos > 0 (at the origin the destination is
+        // legitimately the origin centre) and to a 0.5 m match (the
+        // destination is a point the stock code set, so an exact
+        // centre match is expected; the tolerance covers float
+        // rounding, not a different point). A portal centre that
+        // merely coincides with an earlier segment centre is repaired
+        // the same way -- the forward destination is what the stock
+        // follower would set on the next match anyway. Fail-open: a
+        // repair bug leaves the stock destination unchanged.
+        // Internal (not private): ResyncPathIndex calls it from the
+        // on-route branch, after the index pin.
+        internal static void RepairStaleDestination(Robot bot, int pos, int len)
+        {
+            try
+            {
+                if (pos <= 0)
+                    return;
+                LevelData ld = null;
+                try { ld = GameManager.m_level_data; } catch (Exception) { }
+                if (ld == null || ld.Segments == null)
+                    return;
+                Vector3 dest = bot.m_next_destination_position;
+                int behind = -1;
+                for (int i = 0; i < pos; i++)
+                {
+                    int seg = bot.Global_path[i];
+                    if (seg < 0 || seg >= ld.Segments.Length)
+                        continue;
+                    if ((dest - ld.Segments[seg].Center).sqrMagnitude <= 0.25f)
+                    {
+                        behind = i;
+                        break;
+                    }
+                }
+                if (behind < 0)
+                    return; // destination is forward (or a portal point): leave it alone
+                int next = pos + 1;
+                if (next > len - 1)
+                    next = len - 1;
+                int nextSeg = bot.Global_path[next];
+                if (nextSeg < 0 || nextSeg >= ld.Segments.Length)
+                    return;
+                bot.m_next_destination_position = ld.Segments[nextSeg].Center;
+                SetTargetIsPortal(bot, false); // a segment centre, not a portal point
+                Debug.Log("[GuidebotSteering] stale-origin destination repaired: dest was route seg " +
+                    bot.Global_path[behind] + " centre (path pos " + behind + ", behind bot at pos " + pos +
+                    "), re-resolved to seg " + nextSeg + " centre (path pos " + next + ")");
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] stale-destination repair failed: " + ex.ToString());
+            }
+        }
+
         // Internal (not private): the DoPathFollow postfix
         // (Robot_DoPathFollow_GuidebotSteering, route-resync fix) calls
         // it after the stock follower runs, to make the resync persistent.
@@ -603,6 +774,18 @@ namespace GameMod
                                 " (bot segment " + cur + " at path pos " + pos + ")");
                         }
                     }
+                    // Terrain destination re-resolution (Nov 22,
+                    // 7481ae07 flight): after a kept-path skip the
+                    // destination can be the route-origin segment's
+                    // centre (Global_path[0]) and the stock follower
+                    // never re-resolves it in open terrain, so the
+                    // bot flies backward to the origin. Repair it
+                    // forward to the next route segment's centre.
+                    // Runs after the pin, so it sees the resynced
+                    // index; the DoPathFollow postfix calls this
+                    // after the stock follower, so LogDestination
+                    // records the repaired destination.
+                    RepairStaleDestination(bot, pos, len);
                     return;
                 }
 
@@ -1342,6 +1525,90 @@ namespace GameMod
             catch (System.Exception ex)
             {
                 Debug.Log("[GuidebotSteering] GuideBotLeadPlayer hold postfix failed: " + ex.ToString());
+            }
+        }
+    }
+
+    // Wander guard (Nov 22, 7481ae07 flight): a deactivation in the
+    // terrain threw IndexOutOfRangeException ~26 times in
+    // GuidebotChooseWanderSegment -> Pathfinding.FindGoodNearbySegment
+    // (the bot's segment lookup is unreliable in the big open terrain
+    // cubes, so my_seg -- Robot.SegmentIndex, set each frame in
+    // DoModeGuidebot -- can be invalid), the exception broke the AI,
+    // and the bot fell out of the world (the failsafe put it in seg 0
+    // and it sat stuck in seg 1). Fail-open: when the bot's segment
+    // is a terrain cube or invalid, skip the wander pick entirely --
+    // the bot stays where it is instead of throwing. In GO_AWAY it
+    // keeps fading out via DoModeGuidebot's end-of-frame fade (the
+    // fade does not depend on the wander pick); in WANDER it stays
+    // put. The stock wander is only a "pick a nearby segment to idle
+    // near" convenience; skipping it loses nothing the bot needs.
+    // GuideBot only (the method is GuideBot-only by construction, but
+    // the guard is explicit). Fail-open: a guard bug runs the
+    // original.
+    [HarmonyPatch(typeof(Robot), "GuidebotChooseWanderSegment")]
+    public class Robot_GuidebotChooseWanderSegment_GuidebotSteering
+    {
+        static bool Prefix(Robot __instance, int my_seg)
+        {
+            try
+            {
+                if (__instance == null || !__instance.m_is_guide_bot)
+                    return true;
+                if (!Robot_DoPathfindMovement_GuidebotSteering.IsValidSegment(my_seg))
+                {
+                    Debug.Log("[GuidebotSteering] wander guard: skipping GuidebotChooseWanderSegment, my_seg invalid (" + my_seg + ") -- fail-open, bot stays put");
+                    return false;
+                }
+                if (Robot_DoPathfindMovement_GuidebotSteering.IsTerrainCube(my_seg))
+                {
+                    Debug.Log("[GuidebotSteering] wander guard: skipping GuidebotChooseWanderSegment, my_seg " + my_seg + " is a terrain cube -- fail-open, bot stays put");
+                    return false;
+                }
+                return true;
+            }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] wander guard failed: " + ex.ToString());
+                return true;
+            }
+        }
+    }
+
+    // FindGoodNearbySegment safety net (Nov 22, 7481ae07 flight): the
+    // method indexes Segments[start_seg] and m_SegmentBuffer[start_seg]
+    // with no bounds check, so an invalid start_seg throws
+    // IndexOutOfRangeException (the throw site in the 7481ae07
+    // flight, <0x001a7> in the stack trace). This prefix is the safety
+    // net for ALL callers -- the GuideBot wander path and
+    // Robot.FindBackupSegment's stuck recovery: an invalid start_seg
+    // returns false with actual_path_length = -1, exactly the stock
+    // failure value (the level_data == null branch does the same), so
+    // every caller handles it as "no nearby segment found". A valid
+    // terrain-cube start_seg does NOT throw here (all indices are in
+    // range for a valid segment), so no terrain check is needed at
+    // this level -- the GuideBot's terrain policy lives in the
+    // GuidebotChooseWanderSegment prefix above. Fail-open: a guard bug
+    // runs the original (which throws only if start_seg is genuinely
+    // invalid, as before).
+    [HarmonyPatch(typeof(Pathfinding), "FindGoodNearbySegment")]
+    public class Pathfinding_FindGoodNearbySegment_GuidebotSteering
+    {
+        static bool Prefix(int start_seg, ref int actual_path_length, ref bool __result)
+        {
+            try
+            {
+                if (Robot_DoPathfindMovement_GuidebotSteering.IsValidSegment(start_seg))
+                    return true;
+                actual_path_length = -1;
+                __result = false;
+                Debug.Log("[GuidebotSteering] FindGoodNearbySegment guard: start_seg invalid (" + start_seg + ") -- fail-open, no nearby segment");
+                return false;
+            }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] FindGoodNearbySegment guard failed: " + ex.ToString());
+                return true;
             }
         }
     }
