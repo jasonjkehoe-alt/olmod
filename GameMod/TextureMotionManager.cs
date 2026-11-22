@@ -13,6 +13,15 @@ namespace GameMod
     // static image, so in Overload the panel sits frozen as a yellow
     // barcode. This manager scrolls it per frame, the way D3 does.
     //
+    // Step 2 (Nov 21, 2026): general scrolling - EVERY scrolling texture
+    // in the level, not just EnergyCenter1. The data file lists one entry
+    // per texture (name;slide_u;slide_v;speed) and Scan() matches each
+    // entry against the materials in the scene, so each texture scrolls
+    // at its own table.gam rate. L1: datascroll (0,1), energycenter1
+    // (0,1), pillar (0,-0.2). The per-texture mask decision is in
+    // BuildEmissionMask (below): EnergyCenter1 keeps its mask; the
+    // others scroll + glow unmasked unless their pixels support a mask.
+    //
     // Data: <level>-texturemotion.txt, built by the converter from
     // table.gam (one entry per texture: name;slide_u;slide_v;speed).
     // Loaded by DataReader.GetTextureMotionData (PresetData.cs) — same
@@ -143,6 +152,30 @@ namespace GameMod
         // glow, only 7% of dim-row pixels leak (measured). Tuning
         // parameter - the flight test decides the final value.
         private const int kMaskBrightnessThreshold = 450;
+
+        // Step 2 per-texture mask decision (Nov 21): the mask is only
+        // built when the texture's pixels support it:
+        //   (a) coverage (fraction of pixels >= threshold) in
+        //       [kMaskMinCoverage, kMaskMaxCoverage] - the mask must
+        //       select a meaningful subset, not nearly-all (then it is
+        //       ~unmasked) and not nearly-none (then it kills the glow);
+        //   (b) dark fraction (fraction of pixels < kMaskDarkBrightness)
+        //       >= kMaskMinDarkFraction - the texture must HAVE a dark
+        //       field for the mask to preserve. A texture with no dark
+        //       pixels gains nothing from a mask; masking it would
+        //       manufacture darkness that is not in the texture.
+        // Measured Nov 21 (LevelTextures PNGs):
+        //   energycenter1: 21.6% >= 450, 43.8% < 100 -> MASK (unchanged).
+        //   datascroll:     0.0% >= 450, 83.7% < 100 -> no mask (no bright cores).
+        //   pillar:        19.1% >= 450,  0.0% < 100 -> no mask (no dark field).
+        // When the mask is not built, ApplyGlow falls back to the
+        // unmasked glow (_EmissionMap = _MainTex, kGlowColor) - scroll
+        // + glow, the safe default for the general case. The decision
+        // is logged so the flight log shows it per texture.
+        private const float kMaskMinCoverage = 0.05f;
+        private const float kMaskMaxCoverage = 0.80f;
+        private const int kMaskDarkBrightness = 100;
+        private const float kMaskMinDarkFraction = 0.10f;
 
         // Emission color for MASKED materials only. Lower and more
         // saturated than kGlowColor (1.5): the cores are already bright
@@ -320,14 +353,34 @@ namespace GameMod
             try
             {
                 Color32[] px = src.GetPixels32();
-                Color32[] maskPx = new Color32[px.Length];
+                // Step 2: measure the pixel distribution FIRST, then
+                // decide whether a mask is meaningful for this texture
+                // (see the constants above). A mask is only built when
+                // the bright-core coverage is in band AND the texture
+                // has a dark field to preserve; otherwise return null
+                // and the caller falls back to the unmasked glow.
                 int glowing = 0;
+                int dark = 0;
+                for (int i = 0; i < px.Length; i++)
+                {
+                    int brightness = px[i].r + px[i].g + px[i].b;
+                    if (brightness >= kMaskBrightnessThreshold)
+                        glowing++;
+                    if (brightness < kMaskDarkBrightness)
+                        dark++;
+                }
+                float coverage = (float)glowing / px.Length;
+                float darkFrac = (float)dark / px.Length;
+                if (coverage < kMaskMinCoverage || coverage > kMaskMaxCoverage || darkFrac < kMaskMinDarkFraction)
+                {
+                    Debug.Log("[TextureMotion] mask skipped for '" + src.name + "': coverage " + (100.0f * coverage).ToString("F1", CultureInfo.InvariantCulture) + "% >= " + kMaskBrightnessThreshold + ", dark " + (100.0f * darkFrac).ToString("F1", CultureInfo.InvariantCulture) + "% < " + kMaskDarkBrightness + " - unmasked glow fallback");
+                    return null;
+                }
+                Color32[] maskPx = new Color32[px.Length];
                 for (int i = 0; i < px.Length; i++)
                 {
                     int brightness = px[i].r + px[i].g + px[i].b;
                     byte v = (brightness >= kMaskBrightnessThreshold) ? (byte)255 : (byte)0;
-                    if (v == 255)
-                        glowing++;
                     maskPx[i] = new Color32(v, v, v, 255);
                 }
                 Texture2D mask = new Texture2D(src.width, src.height, TextureFormat.ARGB32, false);
