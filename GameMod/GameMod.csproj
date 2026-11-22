@@ -128,6 +128,7 @@
     <Compile Include="ExtendedConfig.cs" />
     <Compile Include="FastLoad.cs" />
     <Compile Include="FastUserLevelLoad.cs" />
+    <Compile Include="ConsoleMotion.cs" />
     <Compile Include="FrameTime.cs" />
     <Compile Include="GameMod.cs" />
     <Compile Include="GSyncFix.cs" />
