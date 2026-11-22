@@ -77,18 +77,22 @@ namespace GameMod
     // same as the scroll: per-renderer material instances matched by
     // texture name, so other om_signs_01a signs are untouched.
     //
-    // Emission mask (glow mask, Nov 21): at 1.5 the glow washes out
-    // the scrolling animation - the bright bar cores clip to white
-    // under the HDR glow color and bloom into the gaps, so the bars
-    // read as one uniform glowing slab. The mask is derived at level
-    // start from the albedo's own pixels (BuildEmissionMask): white
-    // only on the mid-tone yellow (brightness band-pass), black on
-    // the bright cores and the black field. _EmissionMap then points
-    // at the mask instead of the albedo, so only the yellow edges
-    // emit and the scrolling stays readable. The mask is the same
-    // size as the albedo (pixel-for-pixel), its _MainTex scale/offset
-    // are copied onto the _EmissionMap slot, and scrollEmission is
-    // set true for masked materials, so the mask scrolls in sync.
+    // Emission mask (glow mask, Nov 21; INVERTED Nov 21 fix): at 1.5
+    // the glow washes out the scrolling animation - the bright bar
+    // cores clip to white under the HDR glow color and bloom into the
+    // gaps, so the bars read as one uniform glowing slab. The mask is
+    // derived at level start from the albedo's own pixels
+    // (BuildEmissionMask): white only on the BRIGHT bar cores
+    // (brightness >= threshold), black on the dim troughs and the
+    // black field. _EmissionMap then points at the mask instead of
+    // the albedo, so only the cores emit and the scrolling stays
+    // readable. (The first mask version used a band-pass [100,450)
+    // that made the DIM troughs glow and the bright cores not glow -
+    // that INVERTED the contrast and the panel still read as a solid
+    // yellow strip. Flight Nov 21 ~20:27.) The mask is the same size
+    // as the albedo (pixel-for-pixel), its _MainTex scale/offset are
+    // copied onto the _EmissionMap slot, and scrollEmission is set
+    // true for masked materials, so the mask scrolls in sync.
     // Fail-open: if the texture is unreadable or the mask build
     // fails, ApplyGlow falls back to _MainTex (today's behavior).
     //
@@ -125,16 +129,27 @@ namespace GameMod
         // at room-light level. Only applied to matched materials.
         private static readonly Color kGlowColor = new Color(1.5f, 1.125f, 0.1875f);
 
-        // Emission mask (glow mask, Nov 21): brightness band-pass for
-        // the _EmissionMap. A pixel glows (mask white) only if its
-        // brightness (R+G+B) is in [kMaskMinBrightness,
-        // kMaskMaxBrightness): bright enough to be yellow, but not so
-        // bright that it clips to white under the HDR glow color.
-        // The bright bar cores and the black field stay dark (mask
-        // black). Tuning parameters - the flight test decides the
-        // final values.
-        private const int kMaskMinBrightness = 100;
-        private const int kMaskMaxBrightness = 450;
+        // Emission mask (glow mask, Nov 21; INVERTED Nov 21 fix): the
+        // mask selects the BRIGHT bar cores to glow (brightness >=
+        // kMaskBrightnessThreshold) and the dim troughs stay dark.
+        // The original band-pass [100,450) INVERTED the contrast: it
+        // made the dim trough rows glow brighter than the bright core
+        // rows (measured on the real 64x64 texture: trough rows render
+        // at R~1.5, core rows at R~0.6), so the panel read as a solid
+        // yellow strip with no visible scrolling (flight Nov 21 ~20:27).
+        // The cores ARE the bars and the troughs ARE the gaps - only the
+        // cores glow, so the bars stay bright, the gaps stay dark, and
+        // the scrolling reads. Threshold 450: 71% of bright-row pixels
+        // glow, only 7% of dim-row pixels leak (measured). Tuning
+        // parameter - the flight test decides the final value.
+        private const int kMaskBrightnessThreshold = 450;
+
+        // Emission color for MASKED materials only. Lower and more
+        // saturated than kGlowColor (1.5): the cores are already bright
+        // yellow from the albedo, so a full 1.5 on top clips them toward
+        // white. 1.0 amber keeps them yellow. Unmasked materials still
+        // use kGlowColor (1.5) - see ApplyGlow.
+        private static readonly Color kMaskGlowColor = new Color(1.0f, 0.65f, 0.0f);
 
         // One entry from <level>-texturemotion.txt.
         public class Entry
@@ -251,10 +266,12 @@ namespace GameMod
         }
 
         // Make a matched material glow. If a mask is supplied, _EmissionMap
-        // points at the mask (only the mid-tone yellow emits - the bright
-        // cores and the black field stay dark); otherwise it points at
-        // _MainTex as before (the barcode itself - the stock map is black,
-        // and black x any _EmissionColor emits nothing). When a mask is
+        // points at the mask (only the bright bar cores emit - the dim
+        // troughs and the black field stay dark) and the color is
+        // kMaskGlowColor (1.0 amber, so the cores stay yellow, not white);
+        // otherwise it points at _MainTex as before (the barcode itself -
+        // the stock map is black, and black x any _EmissionColor emits
+        // nothing) and the color is kGlowColor (1.5). When a mask is
         // installed, the _MainTex scale/offset are copied onto the
         // _EmissionMap slot so the mask stays pixel-aligned with the
         // albedo. Called ONCE per material at scan time, never per frame.
@@ -272,12 +289,13 @@ namespace GameMod
                     m.SetTexture("_EmissionMap", mask);
                     m.SetTextureScale("_EmissionMap", m.GetTextureScale("_MainTex"));
                     m.SetTextureOffset("_EmissionMap", m.GetTextureOffset("_MainTex"));
+                    m.SetColor("_EmissionColor", kMaskGlowColor);
                 }
                 else
                 {
                     m.SetTexture("_EmissionMap", m.mainTexture);
+                    m.SetColor("_EmissionColor", kGlowColor);
                 }
-                m.SetColor("_EmissionColor", kGlowColor);
                 m.EnableKeyword("_EMISSION");
                 return true;
             }
@@ -289,22 +307,27 @@ namespace GameMod
         }
 
         // Build an emission mask from a source texture: white where the
-        // pixel brightness (R+G+B) is in the band-pass range, black
-        // otherwise. Same size as the source, so the mask is pixel-for-pixel
-        // aligned with the albedo. The mask is named "<source>_mask" and
-        // inherits the source's wrap/filter mode, so it tiles the same
-        // way. Returns null on any failure - the caller fails open to
-        // the unmasked glow.
+        // pixel brightness (R+G+B) is >= kMaskBrightnessThreshold (the
+        // bright bar cores), black otherwise (the dim troughs and the
+        // black field). Same size as the source, so the mask is
+        // pixel-for-pixel aligned with the albedo. The mask is named
+        // "<source>_mask" and inherits the source's wrap/filter mode, so
+        // it tiles the same way. Returns null on any failure - the caller
+        // fails open to the unmasked glow. Logs the coverage so the
+        // flight log settles whether the mask was built.
         private static Texture2D BuildEmissionMask(Texture2D src)
         {
             try
             {
                 Color32[] px = src.GetPixels32();
                 Color32[] maskPx = new Color32[px.Length];
+                int glowing = 0;
                 for (int i = 0; i < px.Length; i++)
                 {
                     int brightness = px[i].r + px[i].g + px[i].b;
-                    byte v = (brightness >= kMaskMinBrightness && brightness < kMaskMaxBrightness) ? (byte)255 : (byte)0;
+                    byte v = (brightness >= kMaskBrightnessThreshold) ? (byte)255 : (byte)0;
+                    if (v == 255)
+                        glowing++;
                     maskPx[i] = new Color32(v, v, v, 255);
                 }
                 Texture2D mask = new Texture2D(src.width, src.height, TextureFormat.ARGB32, false);
@@ -313,6 +336,7 @@ namespace GameMod
                 mask.filterMode = src.filterMode;
                 mask.SetPixels32(maskPx);
                 mask.Apply();
+                Debug.Log("[TextureMotion] mask built for '" + src.name + "': " + glowing + "/" + px.Length + " px glowing (" + (100.0f * glowing / px.Length).ToString("F1", CultureInfo.InvariantCulture) + "%, threshold >=" + kMaskBrightnessThreshold + ")");
                 return mask;
             }
             catch (Exception ex)
@@ -416,16 +440,17 @@ namespace GameMod
                             Material[] arr = r.sharedMaterials;
                             arr[i] = m;
                             r.sharedMaterials = arr;
-                            // Emission mask (glow mask, Nov 21): derive a mask
-                            // from the albedo pixels - white only on the
-                            // mid-tone yellow, black on the bright cores and
-                            // the black field - so the glow no longer washes
-                            // out the scrolling animation. Built once per
-                            // texture and cached. Fail-open: if the texture
-                            // is not a readable Texture2D, or the mask build
-                            // fails, mask is null and ApplyGlow falls back
-                            // to repointing _EmissionMap at _MainTex (today's
-                            // behavior - the panel still glows, just unmasked).
+                            // Emission mask (glow mask, Nov 21; inverted
+                            // Nov 21 fix): derive a mask from the albedo
+                            // pixels - white only on the BRIGHT cores,
+                            // black on the dim troughs and the black field -
+                            // so only the bars glow and the gaps stay dark.
+                            // Built once per texture and cached. Fail-open:
+                            // if the texture is not a readable Texture2D,
+                            // or the mask build fails, mask is null and
+                            // ApplyGlow falls back to repointing
+                            // _EmissionMap at _MainTex (today's behavior -
+                            // the panel still glows, just unmasked).
                             Texture2D mask = GetOrBuildMask(sharedMat.mainTexture as Texture2D);
                             // Glow (Step 1b): make the panel emit. MUST run
                             // BEFORE scrollEmission is computed below.
@@ -433,6 +458,13 @@ namespace GameMod
                             // properties, the panel still scrolls, it just
                             // does not glow.
                             bool glowing = ApplyGlow(m, mask);
+                            // Diagnostic: log whether the mask was installed
+                            // or fell back to unmasked, so the flight log
+                            // settles it without another build.
+                            if (mask != null)
+                                Debug.Log("[TextureMotion] mask applied to '" + texName + "' (material '" + m.name + "')");
+                            else
+                                Debug.Log("[TextureMotion] mask NULL for '" + texName + "' - unmasked glow fallback");
                             ScrollingMaterial sm = new ScrollingMaterial();
                             sm.material = m;
                             sm.slideU = e.slideU;
