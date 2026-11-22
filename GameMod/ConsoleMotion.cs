@@ -71,6 +71,11 @@ namespace GameMod
             if (motion == null)
                 return;
             s_activated.Add(id);
+            // Steady-glow boost: the touched console's screen gets
+            // brighter/redder (ConsoleGlow, below). If the glow was
+            // never applied (no materials found at level start), this
+            // logs and the flip still runs.
+            ConsoleGlow.BoostOnTouch(carrier);
             Debug.Log("[ConsoleMotion] console activated at " + carrier.position);
         }
 
@@ -98,6 +103,137 @@ namespace GameMod
                 }
             }
             return best;
+        }
+    }
+
+    // Login-console steady glow (Nov 22, 2026; Jason's decision): the
+    // console screen should be LIT all the time (it is a console, the
+    // screen is supposed to be on) -- and on touch it gets BRIGHTER /
+    // turns RED. Jason will check what original Descent 3 does and may
+    // correct this; built as proposed for now.
+    //
+    // The console prop (consoleturnonswitch.OOF, entity_mine_30) wears a
+    // single texture, "p-she strip3", on every part (static + moving_sm1-4
+    // -- prop_switch_manifest.json), so there is no separate screen
+    // material: the steady glow is a moderate warm emission on the
+    // console's own material(s), which reads as the screen being on.
+    // Technique: the TextureMotionManager lesson (Nov 21 bisect) -- NEVER
+    // touch r.materials (it instantiates + renames every material
+    // "X (Instance)" and breaks the game's exact-name glow matching).
+    // Scan r.sharedMaterials read-only, instantiate ONLY the matched
+    // material by hand (new Material), name preserved, installed via
+    // sharedMaterials, _EmissionMap repointed at _MainTex (the stock map
+    // is black, so colour alone would emit black) with a moderate steady
+    // _EmissionColor. p-she strip3 is NOT a scrolling texture
+    // (texturemotion.txt: datascroll, energycenter1, pillar), so the
+    // TextureMotion scan never wraps these instances.
+    //
+    // Hook: postfix on GameplayManager.StartLevel (same pattern as
+    // TextureMotionManager) -- by then the level is loaded and the
+    // renderers/materials exist. The touch boost is applied from the
+    // trigger prefix above, so the flip and the brightening fire
+    // together. Fail-open: if no console / no material is found, log
+    // and continue; the console flip (ConsoleMotion) is untouched and
+    // still works.
+    [HarmonyPatch(typeof(GameplayManager), "StartLevel")]
+    public class GameplayManager_StartLevel_ConsoleGlow
+    {
+        static void Postfix()
+        {
+            try { ConsoleGlow.ApplySteadyGlow(); }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[ConsoleGlow] StartLevel postfix failed: " + ex.ToString());
+            }
+        }
+    }
+
+    public static class ConsoleGlow
+    {
+        // Steady: warm amber at room level -- the screen reads ON
+        // without washing out the texture. Touch: brighter AND redder.
+        private static readonly Color kSteadyEmission = new Color(0.45f, 0.36f, 0.22f);
+        private static readonly Color kTouchEmission = new Color(1.5f, 0.35f, 0.10f);
+
+        // Carrier instance ID -> installed glow material instances.
+        private static readonly Dictionary<int, List<Material>> s_glowByCarrier = new Dictionary<int, List<Material>>();
+
+        public static void ApplySteadyGlow()
+        {
+            s_glowByCarrier.Clear();
+            Transform[] all = Object.FindObjectsOfType<Transform>();
+            int consoles = 0, materials = 0;
+            foreach (Transform t in all)
+            {
+                if (t == null || t.name != "moving_sm1" || t.parent == null)
+                    continue;
+                Transform carrier = t.parent;
+                int id = carrier.GetInstanceID();
+                if (s_glowByCarrier.ContainsKey(id))
+                    continue;
+                List<Material> installed = new List<Material>();
+                Renderer[] renderers = carrier.GetComponentsInChildren<Renderer>();
+                foreach (Renderer r in renderers)
+                {
+                    if (r == null)
+                        continue;
+                    Material[] shared = r.sharedMaterials;
+                    for (int i = 0; i < shared.Length; i++)
+                    {
+                        Material sharedMat = shared[i];
+                        if (sharedMat == null || sharedMat.mainTexture == null)
+                            continue;
+                        if (!sharedMat.HasProperty("_EmissionColor") || !sharedMat.HasProperty("_EmissionMap"))
+                            continue;
+                        // Hand-instantiate ONLY this material (name
+                        // preserved, no " (Instance)" suffix) and install
+                        // it via sharedMaterials -- the game's own idiom.
+                        Material m = new Material(sharedMat);
+                        m.name = sharedMat.name;
+                        m.SetTexture("_EmissionMap", m.mainTexture);
+                        m.SetColor("_EmissionColor", kSteadyEmission);
+                        Material[] arr = r.sharedMaterials;
+                        arr[i] = m;
+                        r.sharedMaterials = arr;
+                        installed.Add(m);
+                        materials++;
+                    }
+                }
+                if (installed.Count > 0)
+                {
+                    s_glowByCarrier[id] = installed;
+                    consoles++;
+                    Debug.Log("[ConsoleGlow] steady glow on console at " + carrier.position + " (" + installed.Count + " material(s))");
+                }
+            }
+            if (consoles == 0)
+                Debug.Log("[ConsoleGlow] no consoles found for steady glow.");
+            else
+                Debug.Log("[ConsoleGlow] steady glow applied to " + consoles + " console(s), " + materials + " material(s).");
+        }
+
+        public static void BoostOnTouch(Transform carrier)
+        {
+            if (carrier == null)
+                return;
+            List<Material> mats;
+            if (!s_glowByCarrier.TryGetValue(carrier.GetInstanceID(), out mats) || mats == null)
+            {
+                Debug.Log("[ConsoleGlow] touch boost: no steady-glow materials recorded for console at " + carrier.position + "; flip still runs.");
+                return;
+            }
+            int n = 0;
+            foreach (Material m in mats)
+            {
+                if (m == null)
+                    continue;
+                if (m.HasProperty("_EmissionColor"))
+                {
+                    m.SetColor("_EmissionColor", kTouchEmission);
+                    n++;
+                }
+            }
+            Debug.Log("[ConsoleGlow] touch boost on console at " + carrier.position + " (" + n + " material(s) brighter/redder).");
         }
     }
 

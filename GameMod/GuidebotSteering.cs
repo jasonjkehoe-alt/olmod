@@ -62,6 +62,29 @@ namespace GameMod
     //   RIDGE <z_min> <z_max> <climb_y> <n_wp> <n_legs> <leg_from> <leg_to> ...
     //   <wp_x> <wp_y> <wp_z>        (n_wp lines, in route order)
     //
+    // Step 2 (Nov 22) -- route-position resync: the Step 1 flight log
+    // proves Global_path_index NEVER advances (stuck at 0/1 the whole
+    // flight, 9 StuckReturn teleports, ridge waypoints oscillating
+    // 604.7 -> 605.9 -> 622.3 -> ...): DoPathFollowPreDefined advances
+    // the index only when m_current_segment == Global_path[index], and
+    // the bot's segment never matches -- it climbs out of the route
+    // segments into 1470, and the stock portal-centre aim never gets it
+    // within 1 m of the next segment. The Step 1 patch overrides the
+    // destination but never the index, so the bot is pulled two ways and
+    // circles. ResyncPathIndex (below) re-syncs the index to the bot's
+    // actual route position every frame, before the leg is read: if the
+    // bot's segment is on the route ahead of the index, jump the index
+    // to the next segment after it; if the bot is off-route (1470), fall
+    // back to the nearest route segment by centre distance (from
+    // GameManager.m_level_data.Segments[].Center, the same source the
+    // stock follower uses) and aim at the next one after it. In the
+    // ridge band that lands on seg 804 (the route segment after the
+    // ridge). Forward-only, so a resync can only accelerate an advance
+    // the stock code would make, or skip a segment the bot is already
+    // physically beyond. The crossings table and the crossing points
+    // are UNCHANGED -- they were correct; the index was the missing
+    // piece.
+    //
     // Fail-open: no table, unreadable table, or no matching entry -> the
     // stock destination is used unchanged. Only the GuideBot is affected
     // (m_is_guide_bot gate); every other robot is untouched, as are the
@@ -135,6 +158,14 @@ namespace GameMod
             // gate keeps combat robots (and every other patch) untouched.
             if (!__instance.m_is_guide_bot)
                 return;
+
+            // ---- route-position resync (Step 2, Nov 22): re-sync
+            // Global_path_index to the bot's actual route position
+            // BEFORE the leg is read below (the doorway/ridge rules key
+            // off the leg). Runs even with no crossings table -- the
+            // stall is in the stock path follower, not the table.
+            ResyncPathIndex(__instance);
+
             CrossingsTable table = GetTable();
             if (table == null)
                 return; // fail-open: no table -> stock destination
@@ -183,6 +214,97 @@ namespace GameMod
                 }
             }
             // No matching entry: stock destination (fail-open).
+        }
+
+        // Re-sync Global_path_index to the bot's actual route position.
+        // Forward-only: the index never moves backward, so a resync can
+        // only accelerate an advance the stock code would make when the
+        // bot enters the segment, or skip a segment the bot is already
+        // physically beyond. One log line per actual resync, so the next
+        // flight log shows whether the index advances.
+        static void ResyncPathIndex(Robot bot)
+        {
+            try
+            {
+                if (bot.Global_path == null || bot.Global_path_length <= 0)
+                    return;
+                int idx = bot.Global_path_index;
+                int len = bot.Global_path_length;
+                int cur = bot.m_current_segment;
+                if (cur < 0)
+                    return; // no containing segment (e.g. mid-teleport): fail-open
+                Vector3 botPos = bot.transform.position;
+
+                // (a) Bot's segment IS on the route: jump the index to
+                // the NEXT segment after it, so the bot aims forward,
+                // not at its own segment. (Setting it to the bot's own
+                // segment would also self-correct -- the stock code
+                // advances on a match -- but aiming forward is the
+                // point of the fix.)
+                int pos = -1;
+                for (int i = 0; i < len; i++)
+                {
+                    if (bot.Global_path[i] == cur) { pos = i; break; }
+                }
+                if (pos >= 0)
+                {
+                    int target = pos + 1;
+                    if (target > len - 1)
+                        target = len - 1;
+                    if (target > idx)
+                    {
+                        bot.Global_path_index = target;
+                        Debug.Log("[GuidebotSteering] resync path index " + idx + " -> " + target +
+                            " (bot segment " + cur + " at path pos " + pos + ")");
+                    }
+                    return;
+                }
+
+                // (b) Bot's segment is NOT on the route (off-route, e.g.
+                // seg 1470 in the ridge climb -- not on the route, not
+                // portal-connected): fall back to the NEAREST route
+                // segment by centre distance, and aim at the next one
+                // after it. In the ridge band this lands on seg 804
+                // (the route segment after the ridge): the bot at the
+                // climb waypoint is nearest to 43's centre, so the
+                // index jumps to 804. Segment centres come from the
+                // level data (GameManager.m_level_data.Segments[].Center,
+                // the same source DoPathFollowPreDefined uses via
+                // m_levelData) -- no crossings-table data is involved.
+                LevelData ld = null;
+                try { ld = GameManager.m_level_data; } catch (Exception) { }
+                if (ld == null || ld.Segments == null)
+                    return;
+                int best = -1;
+                float bestD2 = float.MaxValue;
+                for (int i = 0; i < len; i++)
+                {
+                    int seg = bot.Global_path[i];
+                    if (seg < 0 || seg >= ld.Segments.Length)
+                        continue;
+                    Vector3 c = ld.Segments[seg].Center;
+                    float d2 = (botPos - c).sqrMagnitude;
+                    if (d2 < bestD2) { bestD2 = d2; best = i; }
+                }
+                if (best < 0)
+                    return;
+                int target2 = best + 1;
+                if (target2 > len - 1)
+                    target2 = len - 1;
+                if (target2 > idx)
+                {
+                    bot.Global_path_index = target2;
+                    Debug.Log("[GuidebotSteering] resync path index " + idx + " -> " + target2 +
+                        " (off-route seg " + cur + ", nearest route seg " + bot.Global_path[best] +
+                        " at path pos " + best + ")");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Fail-open: a resync bug must never break pathing --
+                // the stock destination is used unchanged.
+                Debug.Log("[GuidebotSteering] resync failed: " + ex.ToString());
+            }
         }
 
         static bool TryRidgeDestination(RidgeEntry rg, int fromSeg, int toSeg,

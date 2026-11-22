@@ -137,6 +137,7 @@
     <Compile Include="GuidebotAutoExit.cs" />
     <Compile Include="GuidebotSteering.cs" />
     <Compile Include="SwitchRotateOnce.cs" />
+    <Compile Include="HatchHandlePress.cs" />
     <Compile Include="SwatterHp.cs" />
     <Compile Include="TextureMotionManager.cs" />
     <Compile Include="RelentlessGoblin.cs" />
