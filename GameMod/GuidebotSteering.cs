@@ -272,12 +272,16 @@ namespace GameMod
                     return; // no containing segment (e.g. mid-teleport): fail-open
                 Vector3 botPos = bot.transform.position;
 
-                // (a) Bot's segment IS on the route: jump the index to
-                // the NEXT segment after it, so the bot aims forward,
-                // not at its own segment. (Setting it to the bot's own
-                // segment would also self-correct -- the stock code
-                // advances on a match -- but aiming forward is the
-                // point of the fix.)
+                // (a) Bot's segment IS on the route: catch the index UP
+                // TO the bot's position, not past it. The stock
+                // DoPathFollowPreDefined advance fires only on
+                // m_current_segment == Global_path[index], and that
+                // advance is what sets the destination (next segment
+                // centre, or portal centre). Setting pos+1 skips the
+                // match and leaves the destination stale -- the bot
+                // hovers at its own segment centre (resync-deadlock
+                // fix, Nov 22: the old pos+1 target stalled the bot
+                // in seg 217 with index 1 for a whole flight).
                 int pos = -1;
                 for (int i = 0; i < len; i++)
                 {
@@ -285,7 +289,7 @@ namespace GameMod
                 }
                 if (pos >= 0)
                 {
-                    int target = pos + 1;
+                    int target = pos;
                     if (target > len - 1)
                         target = len - 1;
                     if (target > idx)
