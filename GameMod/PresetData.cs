@@ -199,6 +199,74 @@ namespace GameMod
             return null;
         }
 
+        public static string GetGuidebotCrossingsData()
+        {
+            // Look for "<level>-guidebot-crossings.txt" in SP/CM zip files and
+            // use if possible. Same pattern as GetTextureMotionData, with the
+            // both-variants fix: Mission.LoadAddonData does an exact-name zip
+            // lookup (zipFile[filepath]), so a full Windows path NEVER matches
+            // a bare zip entry (proven Nov 20 by indexing the real deployed
+            // mission zip with the game's own DotNetZip.dll: full-path ->
+            // NULL, bare -> FOUND). The full-path tries cover the loose case
+            // (ZipPath == null -> FindAddonFile reads the loose file next to
+            // the .sp); the bare tries cover the zip case. The crossings
+            // table is baked by the converter (GuideBot steering Step 1,
+            // Nov 22) and shipped loose AND in the mission zip.
+            if (!GameplayManager.IsMultiplayer && GameplayManager.Level.IsAddOn)
+            {
+                var filePaths = new string[]
+                    {
+                        Path.Combine(Path.GetDirectoryName(GameplayManager.Level.FilePath), $"{GameplayManager.Level.FileName}-guidebot-crossings"),
+                        Path.Combine(Path.GetDirectoryName(GameplayManager.Level.FilePath), $"{GameplayManager.Level.Mission.FileName}-guidebot-crossings"),
+                        Path.Combine(Path.GetDirectoryName(GameplayManager.Level.FilePath), "guidebot-crossings")
+                    };
+                // Full-path tries (loose case: FindAddonFile; zip case: miss).
+                foreach (var filepath in filePaths)
+                {
+                    string text3 = null;
+                    byte[] array = Mission.LoadAddonData(GameplayManager.Level.ZipPath, filepath, ref text3, new string[]
+                    {
+                    ".txt"
+                    });
+                    if (array != null)
+                    {
+                        return System.Text.Encoding.UTF8.GetString(array);
+                    }
+                }
+                // Bare-filename tries (zip case: exact match on the bare entry).
+                var bareNames = new string[]
+                    {
+                        $"{GameplayManager.Level.FileName}-guidebot-crossings",
+                        $"{GameplayManager.Level.Mission.FileName}-guidebot-crossings",
+                        "guidebot-crossings"
+                    };
+                foreach (var bareName in bareNames)
+                {
+                    string text3 = null;
+                    byte[] array = Mission.LoadAddonData(GameplayManager.Level.ZipPath, bareName, ref text3, new string[]
+                    {
+                    ".txt"
+                    });
+                    if (array != null)
+                    {
+                        return System.Text.Encoding.UTF8.GetString(array);
+                    }
+                }
+            }
+            // Fallback: OLMODDIR/guidebot-crossings.txt (loose override, same
+            // as GetTextureMotionData).
+            try
+            {
+                string dir = Environment.GetEnvironmentVariable("OLMODDIR");
+                if (!string.IsNullOrEmpty(dir))
+                    return File.ReadAllText(Path.Combine(dir, "guidebot-crossings.txt"));
+            }
+            catch (Exception)
+            {
+            }
+            return null;
+        }
+
         public static void ReadFieldFilter(object obj, string name, string value, ProjPrefab id)
         {
             // define entries here for any custom data that should be read

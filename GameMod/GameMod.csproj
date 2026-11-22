@@ -135,6 +135,7 @@
     <Compile Include="GSyncFix.cs" />
     <Compile Include="GuidebotStuckReturn.cs" />
     <Compile Include="GuidebotAutoExit.cs" />
+    <Compile Include="GuidebotSteering.cs" />
     <Compile Include="SwitchRotateOnce.cs" />
     <Compile Include="SwatterHp.cs" />
     <Compile Include="TextureMotionManager.cs" />
