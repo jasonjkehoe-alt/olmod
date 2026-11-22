@@ -34,14 +34,21 @@ namespace GameMod
     // (which sets the next frame's destination), so the prefix steers on
     // the destination set last frame -- no frame of lag that matters.
     //
-    // The leg is keyed off the PATH (Global_path + Global_path_index),
-    // not off m_current_segment: the climb to y=50 takes the bot out of
-    // the route segments (808/43/804 top at y=48.9) and into segment
-    // 1470's volume, which is not on the route and not portal-connected
-    // to it, so the bot's physical segment may be off-route while it
-    // climbs. The path index is the reliable leg signal. The ridge rule
-    // is additionally position-based (bot inside the band), so it applies
-    // even if the path index is stuck.
+    // The leg is the leg the bot is TRAVERSING -- its own route
+    // position to the next route segment -- not (index-1 -> index):
+    // ResyncPathIndex pins the index to the bot's position (Nov 22
+    // pull-back fix), so the index-based leg would be the leg INTO
+    // the bot's segment, one leg too late for the doorway/ridge
+    // rules, which must fire while the bot is still in the FROM
+    // segment. The climb to y=50 takes the bot out of the route
+    // segments (808/43/804 top at y=48.9) and into segment 1470's
+    // volume, which is not on the route and not portal-connected
+    // to it, so the bot's physical segment may be off-route while
+    // it climbs; when it is not on the route at all, the leg falls
+    // back to the index-based read. The ridge rule is additionally
+    // position-based (bot inside the band AND near the ridge -- see
+    // the proximity guard), so it applies even if the path index
+    // is stuck.
     //
     // The ridge is a waypoint SEQUENCE, not a single fixed point: the
     // direct line from the doorway crossing to the lifted 808 centre is
@@ -126,11 +133,12 @@ namespace GameMod
     // GameManager.m_level_data.Segments[].Center, the same source the
     // stock follower uses) and aim at the next one after it. In the
     // ridge band that lands on seg 804 (the route segment after the
-    // ridge). Forward-only, so a resync can only accelerate an advance
-    // the stock code would make, or skip a segment the bot is already
-    // physically beyond. The crossings table and the crossing points
-    // are UNCHANGED -- they were correct; the index was the missing
-    // piece.
+    // ridge). On-route the index now also moves BACKWARD to the bot's
+    // position (Nov 22 pull-back fix -- see the ridge-guard + index
+    // pull-back section below), so a visibility-based advance past
+    // the bot cannot stick; the off-route branch stays forward-only.
+    // The crossings table and the crossing points are UNCHANGED --
+    // they were correct; the index was the missing piece.
     //
     // Fix (Nov 22, route-resync fix) -- the resync alone was NOT enough:
     // the route-resync flight log shows the index keeps resetting to 0
@@ -163,8 +171,48 @@ namespace GameMod
     //       (CreatePathToSegment/InitPath,
     //       CreatePathToBelievedPlayerPosition, GuidebotChooseWander-
     //       Segment) cannot stick past the frame it happened in.
-    //       ResyncPathIndex is forward-only, so it never fights the
-    //       stock index advance.
+    //       ResyncPathIndex pulls the index back to the bot's
+    //       position on-route (Nov 22 pull-back fix), so a stock
+    //       advance past the bot cannot stick past the frame it
+    //       happened in either; the off-route branch stays
+    //       forward-only.
+    //
+    // Ridge-guard + index pull-back (Nov 22) -- the d4491740 flight:
+    // the spawn exit WORKED (doorway-approach + doorway-crossing fired,
+    // bot in 213) and the TO_GOAL hold WORKED (goal 752, zero flips),
+    // but the bot then went east off-route to 227/231 and stalled at a
+    // wall in 231, 22 m from the spawn -- never leaving Jason's sight.
+    // One mechanism, two instances: the destination is set to a far
+    // point whose straight line is blocked, and nothing pulls it back.
+    //   (1) Ridge hijack: the ridge rule fired on the z-band [450, 462]
+    //       only, with NO x-proximity check, so it fired at the spawn
+    //       room ~214 m west of the actual ridge -- and the route north
+    //       from 213 runs through 850/849, both inside the band, so the
+    //       route itself walks into it. The ridge destination (604.7,
+    //       50.0, 456.0) is unreachable in a straight line from 213
+    //       (-0.595 m). Fix: the ridge rule now fires only when the bot
+    //       is within kRidgeProximity (30 m) of a ridge waypoint.
+    //   (2) Index runaway: the stock MaybeAdvanceSegment advances the
+    //       index every 0.2 s whenever the NEXT segment is merely
+    //       visible -- visibility is not flyability -- so the index ran
+    //       to 7 in 213 (destination seg 110, line blocked -0.346 m)
+    //       and to 6 in 231 (destination seg 161, blocked -0.521 m),
+    //       while the next route segments 850/858 sat clear (+0.108 /
+    //       +0.147 m), never aimed at. Fix: ResyncPathIndex now pulls
+    //       the index BACK to the bot's route position on-route, so
+    //       the stock match (m_current_segment == Global_path[index])
+    //       fires every frame and re-derives the destination to the
+    //       NEXT route segment. The leg read in PrefixInner now uses
+    //       the bot's route position (pos -> pos+1) for the same
+    //       reason -- with the index pinned to the bot's position,
+    //       the old (index-1 -> index) leg would be the leg INTO the
+    //       bot's segment, and the doorway rule would only fire after
+    //       the bot had already crossed. The doorway waypoints, the
+    //       table, and TryDoorwayDestination are UNTOUCHED.
+    //   The off-route branch of ResyncPathIndex stays forward-only
+    //   (best). A routine 1-step pull-back (undoing the stock advance)
+    //   is silent; a pull-back of 2+ is logged, so the flight log
+    //   shows the runaway being corrected without spamming.
     //
     // Fail-open: no table, unreadable table, or no matching entry -> the
     // stock destination is used unchanged. Only the GuideBot is affected
@@ -232,6 +280,17 @@ namespace GameMod
 
         private const float kWaypointReach = 2.0f;
 
+        // Ridge proximity guard (Nov 22, d4491740 flight): the ridge
+        // rule used to fire on the z-band alone, anywhere in the level
+        // at that z -- including the spawn room, ~214 m west of the
+        // actual ridge. The ridge waypoints span x 604.69-622.32; the
+        // spawn complex is x 387-434. A 30 m 3D distance to the nearest
+        // ridge waypoint keeps the rule live for the real climb
+        // (approach segments 42/807/808/43/804 are 27.1/19.6/15.9/4.3/
+        // 3.8 m from a waypoint, measured from segment centres) and
+        // dead everywhere else (nearest spawn segment is 171 m away).
+        private const float kRidgeProximity = 30f;
+
         static void Prefix(Robot __instance)
         {
             try { PrefixInner(__instance); }
@@ -258,19 +317,42 @@ namespace GameMod
 
             Vector3 botPos = __instance.transform.position;
 
-            // Current leg from the PATH, not the physical segment (the
-            // bot's physical segment may be off-route while climbing --
-            // see the header comment on segment 1470).
+            // Current leg: the leg the bot is TRAVERSING -- its own
+            // route position to the next route segment -- not
+            // (index-1 -> index). ResyncPathIndex pins the index to
+            // the bot's position, so the index-based leg would be the
+            // leg INTO the bot's segment, one leg too late: the
+            // doorway/ridge rules must fire while the bot is still in
+            // the FROM segment. (Ridge-guard + index pull-back fix,
+            // Nov 22.) The bot's physical segment may be off-route
+            // while climbing (see the header comment on segment
+            // 1470), so when it is not on the route at all, fall back
+            // to the index-based leg.
             int fromSeg = -1, toSeg = -1;
             if (__instance.Global_path != null && __instance.Global_path_length > 0)
             {
-                int idx = __instance.Global_path_index;
-                if (idx >= 0 && idx < __instance.Global_path_length)
+                int len = __instance.Global_path_length;
+                int pos = -1;
+                int cur = __instance.m_current_segment;
+                for (int i = 0; i < len; i++)
                 {
-                    toSeg = __instance.Global_path[idx];
-                    fromSeg = (idx > 0)
-                        ? __instance.Global_path[idx - 1]
-                        : __instance.m_current_segment;
+                    if (__instance.Global_path[i] == cur) { pos = i; break; }
+                }
+                if (pos >= 0 && pos + 1 < len)
+                {
+                    fromSeg = __instance.Global_path[pos];
+                    toSeg = __instance.Global_path[pos + 1];
+                }
+                else
+                {
+                    int idx = __instance.Global_path_index;
+                    if (idx >= 0 && idx < len)
+                    {
+                        toSeg = __instance.Global_path[idx];
+                        fromSeg = (idx > 0)
+                            ? __instance.Global_path[idx - 1]
+                            : cur;
+                    }
                 }
             }
 
@@ -303,6 +385,12 @@ namespace GameMod
             {
                 if (botPos.z < rg.ZMin || botPos.z > rg.ZMax)
                     continue;
+                // Ridge-guard (Nov 22): the z-band alone is not a
+                // location -- it fired at the spawn room, ~214 m west
+                // of the ridge. The rule fires only when the bot is
+                // actually near the climb.
+                if (!IsNearRidge(rg, botPos))
+                    continue;
                 Vector3 dest;
                 if (TryRidgeDestination(rg, fromSeg, toSeg, botPos, out dest))
                 {
@@ -314,11 +402,21 @@ namespace GameMod
         }
 
         // Re-sync Global_path_index to the bot's actual route position.
-        // Forward-only: the index never moves backward, so a resync can
-        // only accelerate an advance the stock code would make when the
-        // bot enters the segment, or skip a segment the bot is already
-        // physically beyond. One log line per actual resync, so the next
-        // flight log shows whether the index advances.
+        // On-route, the index moves BOTH ways: forward to the bot's
+        // position (accelerating an advance the stock code would make
+        // when the bot enters the segment, or skipping a segment the
+        // bot is already physically beyond) AND back down to it -- the
+        // pull-back (Nov 22, d4491740 flight): the stock
+        // MaybeAdvanceSegment advances the index every 0.2 s whenever
+        // the next segment is merely visible, so the index runs far
+        // ahead of the bot and the destination sticks at a far
+        // segment's blocked centre. Pulling it back to the bot's
+        // position makes the stock match fire every frame and
+        // re-derive the destination to the next route segment. The
+        // off-route branch stays forward-only. One log line per actual
+        // resync, so the next flight log shows whether the index
+        // advances (a routine 1-step pull-back is silent; a pull-back
+        // of 2+ is logged).
         // Internal (not private): the DoPathFollow postfix
         // (Robot_DoPathFollow_GuidebotSteering, route-resync fix) calls
         // it after the stock follower runs, to make the resync persistent.
@@ -335,8 +433,8 @@ namespace GameMod
                     return; // no containing segment (e.g. mid-teleport): fail-open
                 Vector3 botPos = bot.transform.position;
 
-                // (a) Bot's segment IS on the route: catch the index UP
-                // TO the bot's position, not past it. The stock
+                // (a) Bot's segment IS on the route: pin the index TO
+                // the bot's position, not past it. The stock
                 // DoPathFollowPreDefined advance fires only on
                 // m_current_segment == Global_path[index], and that
                 // advance is what sets the destination (next segment
@@ -344,7 +442,16 @@ namespace GameMod
                 // match and leaves the destination stale -- the bot
                 // hovers at its own segment centre (resync-deadlock
                 // fix, Nov 22: the old pos+1 target stalled the bot
-                // in seg 217 with index 1 for a whole flight).
+                // in seg 217 with index 1 for a whole flight). And
+                // letting the index sit AHEAD of the bot is worse:
+                // MaybeAdvanceSegment runs it ahead on mere
+                // visibility, and the destination sticks at a far
+                // segment's blocked centre (pull-back fix, Nov 22:
+                // index 7 in seg 213, 6 in seg 231, destinations
+                // 110/161 blocked while the next route segments
+                // 850/858 were clear). Pinning the index to pos makes
+                // the match fire every frame and re-derive the
+                // destination to the next route segment.
                 int pos = -1;
                 for (int i = 0; i < len; i++)
                 {
@@ -355,11 +462,23 @@ namespace GameMod
                     int target = pos;
                     if (target > len - 1)
                         target = len - 1;
-                    if (target > idx)
+                    if (target != idx)
                     {
                         bot.Global_path_index = target;
-                        Debug.Log("[GuidebotSteering] resync path index " + idx + " -> " + target +
-                            " (bot segment " + cur + " at path pos " + pos + ")");
+                        // Pull-back (Nov 22): a routine 1-step undo of
+                        // the stock advance happens every frame and is
+                        // silent; a pull-back of 2+ is the runaway
+                        // being corrected and is logged.
+                        if (target < idx && idx - target >= 2)
+                        {
+                            Debug.Log("[GuidebotSteering] resync path index " + idx + " -> " + target +
+                                " (pull-back: bot segment " + cur + " at path pos " + pos + ")");
+                        }
+                        else if (target > idx)
+                        {
+                            Debug.Log("[GuidebotSteering] resync path index " + idx + " -> " + target +
+                                " (bot segment " + cur + " at path pos " + pos + ")");
+                        }
                     }
                     return;
                 }
@@ -415,6 +534,22 @@ namespace GameMod
                 // the stock destination is used unchanged.
                 Debug.Log("[GuidebotSteering] resync failed: " + ex.ToString());
             }
+        }
+
+        // True when the bot is within kRidgeProximity of any waypoint
+        // of the ridge entry (3D distance). The ridge waypoints ARE the
+        // climb, so this is the location the z-band was standing in for.
+        static bool IsNearRidge(RidgeEntry rg, Vector3 botPos)
+        {
+            if (rg.Waypoints == null || rg.Waypoints.Count == 0)
+                return false;
+            float d2 = kRidgeProximity * kRidgeProximity;
+            foreach (Vector3 wp in rg.Waypoints)
+            {
+                if ((botPos - wp).sqrMagnitude <= d2)
+                    return true;
+            }
+            return false;
         }
 
         static bool TryRidgeDestination(RidgeEntry rg, int fromSeg, int toSeg,
@@ -925,8 +1060,10 @@ namespace GameMod
     // runs, so a Global_path_index reset anywhere in the stock code --
     // CreatePathToSegment/InitPath, CreatePathToBelievedPlayerPosition,
     // GuidebotChooseWanderSegment -- cannot stick past the frame it
-    // happened in. ResyncPathIndex is forward-only, so it can only
-    // accelerate an advance the stock code would make, never fight it.
+    // happened in. ResyncPathIndex pulls the index back to the bot's
+    // position on-route (Nov 22 pull-back fix), so a stock advance
+    // past the bot cannot stick past the frame it happened in either;
+    // the off-route branch stays forward-only.
     // Fail-open: any exception is logged and the stock destination
     // stands. GuideBot only.
     [HarmonyPatch(typeof(Robot), "DoPathFollow")]
