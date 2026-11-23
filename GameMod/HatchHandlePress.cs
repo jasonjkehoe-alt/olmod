@@ -76,8 +76,9 @@ namespace GameMod
         {
             if (__instance == null)
                 return true;
-            // Log every SWITCH intercept (only 4 SWITCH Destroyables in
-            // L1: the 3 mine_31 + the handle) so the log proves the patch
+            // Log every SWITCH intercept (only 5 SWITCH Destroyables in
+            // L1: the 3 mine_31 + the handle + the circular-door marker)
+            // so the log proves the patch
             // is live and shows which one was hit. Non-SWITCH
             // Destroyables (barrels, grates, reactors, panels) are not
             // logged -- they are numerous and irrelevant here.
@@ -88,10 +89,14 @@ namespace GameMod
                     __instance.m_special_index + " at " + __instance.transform.position);
             }
             // Only the mine_32 hatch handle: a SWITCH that is NOT a
-            // mine_31. Everything else (mine_31 switches -- left to
-            // SwitchRotateOnce -- barrels, grates, reactors, secret
+            // mine_31 and NOT a circular-door marker (33 -- CircularDoor.cs
+            // owns those; without this exclusion the handle patch would
+            // claim the marker, find no "moving" child, and fall through
+            // to stock explode). Everything else (mine_31 switches -- left
+            // to SwitchRotateOnce -- barrels, grates, reactors, secret
             // panels) runs the stock method untouched.
-            if (!isSwitch || __instance.m_special_index == kMine31SpecialIndex)
+            if (!isSwitch || __instance.m_special_index == kMine31SpecialIndex
+                || __instance.m_special_index == CircularDoorPatch.kCircularDoorSpecialIndex)
                 return true;
 
             int id = __instance.GetInstanceID();
