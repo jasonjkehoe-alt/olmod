@@ -1373,14 +1373,27 @@ namespace GameMod
         //      glass-stall signature -- the glass itself is fix #5's
         //      scope; this only breaks the cycle, it does not make the
         //      bot pass the pane.)
-        //   C. MaybeAdvance clamp: the destination is a route segment
-        //      at pos+2 or beyond (a visibility advance) while the bot
-        //      is within 3.0 m of a doorway crossing -- clamp the
-        //      destination to the current leg's portal centre (or the
-        //      crossing, when the current leg is itself a doorway
-        //      leg), so the bot stays on the portal line until it is
-        //      through the doorway instead of being pulled to a far
-        //      segment's centre 14 m away (1707: 1322's centre).
+        //   C. Far-centre cycle-break (any leg, any level): the
+        //      destination is a route segment at pos+2 or beyond (a
+        //      visibility advance the bot has not earned by crossing
+        //      the current leg's portal) -- redirect it to the
+        //      push-through point (the current leg's portal centre,
+        //      or its baked crossing on a doorway leg, pushed 1.5 m
+        //      beyond the plane along the portal normal), so the bot
+        //      stays on the portal line until it is through instead
+        //      of being pulled to a far segment's centre 14 m away
+        //      (1707: 1322's centre). Generalised Nov 23: the old
+        //      clamp only fired within 3.0 m of a
+        //      baked doorway crossing, so a far-centre destination on
+        //      a plain leg flipped against the portal-centre re-aim
+        //      every steering cycle and the bot coasted to a stop in
+        //      open space 13.4 m from the portal. The gate is now the
+        //      destination itself, not the doorway table, and the
+        //      target is the push-through point, not the portal
+        //      centre -- the portal centre and the push-through point
+        //      are ~1.5 m apart, so the force builds in one
+        //      direction where the far centre and the portal centre
+        //      were far apart and cancelled.
         internal static void HoldPortalLine(Robot bot)
         {
             try
@@ -1503,30 +1516,64 @@ namespace GameMod
                         return;
                     }
                 }
-                // Case C -- MaybeAdvance clamp (any leg).
-                if (table != null)
+                // Case C -- far-centre cycle-break (any leg, any
+                // level). Generalised Nov 23: the old
+                // clamp only fired within 3.0 m of a baked doorway
+                // crossing, so a far-centre destination on a plain leg
+                // flipped against the portal-centre re-aim every
+                // steering cycle and the constant-magnitude AddForce
+                // cancelled -- the bot coasted to a stop in OPEN SPACE
+                // 13.4 m from the portal (492 stuck-watch lines, zero
+                // recovery: the stock reset never fired, stay peaked
+                // at 23). The gate is now the destination itself, not
+                // the doorway table: when the bot is still in the
+                // traversing leg's fromSeg and its destination is the
+                // centre of a route segment at pos+2 or beyond (a
+                // visibility advance the bot has not earned by crossing
+                // the current leg's portal -- MaybeAdvanceSegment
+                // advances the index on mere visibility), redirect it
+                // to the push-through point the other cases already
+                // use (the current leg's portal centre, or its baked
+                // crossing on a doorway leg, pushed 1.5 m beyond the
+                // plane along the portal normal). The two aims the
+                // cycle alternated between (portal centre, far centre)
+                // are far apart, so the force cancelled; the portal
+                // centre and the push-through point are ~1.5 m apart,
+                // so the force builds in one direction and the bot
+                // crosses. Does NOT fire when the destination is
+                // already the portal centre, the next (pos+1) centre,
+                // or a staged crossing/approach from the movement
+                // prefix: those are never a pos+2-or-beyond centre
+                // (the loop starts at pos+2), and the prefix always
+                // gets the first word each movement frame, so a staged
+                // waypoint is never overridden here -- this only
+                // corrects the stock follower's far-centre re-aim.
+                // No crossings-table dependency: the clamp reads only
+                // the route, the portal quad, and segment centres, so
+                // it applies on any leg of any level, table or not.
+                for (int i = pos + 2; i < len; i++)
                 {
-                    bool nearDoorway = false;
-                    foreach (DoorwayEntry e in table.Doorways)
+                    Vector3 far;
+                    if (!TryGetSegmentCentre(bot.Global_path[i], out far))
+                        continue;
+                    if (Vector3.Distance(dest, far) < 0.5f)
                     {
-                        if (Vector3.Distance(botPos, e.Crossing) < 3.0f)
-                        { nearDoorway = true; break; }
-                    }
-                    if (nearDoorway)
-                    {
-                        for (int i = pos + 2; i < len; i++)
+                        Vector3 clampTarget;
+                        if (dw != null)
                         {
-                            Vector3 far;
-                            if (!TryGetSegmentCentre(bot.Global_path[i], out far))
-                                continue;
-                            if (Vector3.Distance(dest, far) < 0.5f)
-                            {
-                                Vector3 clampTarget = (dw != null) ? dw.Crossing : pc;
-                                SetDestination(bot, clampTarget,
-                                    "portal-crossing MaybeAdvance clamp " + fromSeg + "->" + toSeg);
-                                return;
-                            }
+                            clampTarget = haveNormal
+                                ? dw.Crossing + portalNormal * kPushThroughDistance
+                                : dw.Crossing;
                         }
+                        else
+                        {
+                            clampTarget = haveNormal
+                                ? pc + portalNormal * kPushThroughDistance
+                                : pc;
+                        }
+                        SetDestination(bot, clampTarget,
+                            "portal-crossing far-centre clamp " + fromSeg + "->" + toSeg);
+                        return;
                     }
                 }
             }

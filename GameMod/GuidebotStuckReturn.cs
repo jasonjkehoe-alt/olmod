@@ -104,6 +104,21 @@ namespace GameMod
         private static AIGuidebotSubmodeType s_teleportGoal = AIGuidebotSubmodeType.NONE;
         private static bool s_teleportAccessorsLogged;
 
+        // Free-space stall sensor (Nov 23 flight): the stock
+        // recovery only counts wall-contact resets (stay > 50), and a
+        // bot stalled in OPEN SPACE never trips it -- stay peaked at 23
+        // in 150 s while the bot sat 13.4 m from the portal, 492
+        // stuck-watch lines, zero recoveries. The stuck-watch condition
+        // (|v| < 0.05, destination > 1.0 m away) already detects exactly
+        // this stall; this sensor turns it into a trigger.
+        private const float kFreeStallSpeed = 0.05f;      // |v| below this counts as still (same as the stuck-watch)
+        private const float kFreeStallDestDist = 1.0f;    // destination farther than this counts as unreached (same as the stuck-watch)
+        private const float kFreeStallMove = 0.5f;        // the bot must not have moved this far from the window-open position
+        private const float kFreeStallWindow = 12.0f;     // continuous still window before the sensor fires
+        private const float kForcefieldWaitRadius = 6.0f; // an active forcefield within this of the bot = a legitimate field wait, not a stall
+        private static float s_freeStallSince = -1f;      // game time the current still window opened (-1 = none)
+        private static Vector3 s_freeStallRefPos;         // bot position when the current still window opened
+
         private static FieldInfo GetField(string name)
         {
             try { return AccessTools.Field(typeof(Robot), name); }
@@ -173,19 +188,24 @@ namespace GameMod
             if (count > 50)
                 s_resetFirings++;
 
-            if (s_resetFirings < kResetFiringsToTrigger)
+            float gameTime = (float)GameplayManager.m_game_time;
+
+            // Free-space stall sensor (Nov 23 flight): a second,
+            // independent trigger -- the stock counter above only fires on
+            // wall contact, so a bot stalled in open space never reaches
+            // it. See CheckFreeSpaceStall: 12 s still, destination far,
+            // position unchanged. Either trigger runs the same recovery
+            // below (return / teleport-forward, limitless, logged).
+            bool freeSpaceStall = CheckFreeSpaceStall(__instance, gameTime);
+
+            if (s_resetFirings < kResetFiringsToTrigger && !freeSpaceStall)
                 return;
             s_resetFirings = 0;
 
             // Only interrupt a goal submode. Never while already returning,
             // wandering, deactivated, or idle.
             AIGuidebotSubmodeType submode = Robot.AI_guidebot_submode;
-            if (submode == AIGuidebotSubmodeType.GO_TO_PLAYER ||
-                submode == AIGuidebotSubmodeType.WANDER_NEAR_PLAYER ||
-                submode == AIGuidebotSubmodeType.NONE ||
-                submode == AIGuidebotSubmodeType.GO_AWAY ||
-                submode == AIGuidebotSubmodeType.NAPPING ||
-                submode == AIGuidebotSubmodeType.START)
+            if (!IsGoalSubmode(submode))
                 return;
 
             // Late-fire guard (Nov 23, c0472d38 flight): the stock
@@ -214,8 +234,6 @@ namespace GameMod
                 }
                 catch (Exception) { /* fail-open: proceed with recovery */ }
             }
-
-            float gameTime = (float)GameplayManager.m_game_time;
 
             // Where is the player on the current goal route? Both recoveries
             // need this, so it is computed once, before either budget block.
@@ -281,6 +299,168 @@ namespace GameMod
                 return;
             }
             Debug.Log("[GuidebotStuckReturn] bot wedged (goal " + submode + ", seg " + __instance.Global_path[idx] + ", recovery " + s_recoveries + "); returning to player.");
+        }
+
+        // The goal submodes the recovery interrupts (shared by the
+        // stock-reset trigger above and the free-space sensor below):
+        // everything except the return / wander / idle set. The sensor
+        // uses the same list, so a window can only accumulate while the
+        // bot is actually guiding toward a goal -- it can never fire on
+        // resume from a return.
+        static bool IsGoalSubmode(AIGuidebotSubmodeType submode)
+        {
+            return submode != AIGuidebotSubmodeType.GO_TO_PLAYER &&
+                   submode != AIGuidebotSubmodeType.WANDER_NEAR_PLAYER &&
+                   submode != AIGuidebotSubmodeType.NONE &&
+                   submode != AIGuidebotSubmodeType.GO_AWAY &&
+                   submode != AIGuidebotSubmodeType.NAPPING &&
+                   submode != AIGuidebotSubmodeType.START;
+        }
+
+        static void ResetFreeSpaceWindow()
+        {
+            s_freeStallSince = -1f;
+        }
+
+        // Free-space stall sensor (Nov 23 flight). Returns true
+        // when the bot has been still (|v| < 0.05, the stuck-watch
+        // threshold) with a destination > 1.0 m away (the stuck-watch
+        // threshold) and has not moved 0.5 m from its window-open
+        // position for a continuous 12 s. The stuck-watch condition in
+        // LogDestination (GuidebotSteering) detects exactly this stall,
+        // but nothing acted on it: the stock recovery counts consecutive
+        // stock stuck-resets, which fire only on wall contact (stay >
+        // 50), and a bot stalled in open space never trips them (stay
+        // peaked at 23 in 150 s). When this returns true the caller runs
+        // the EXISTING recovery (return / teleport-forward) -- this is a
+        // second trigger, not a second recovery. Self-consuming: a true
+        // return resets the window, so the recovery is attempted at most
+        // once per 12 s still episode; a declined recovery (player
+        // off-route) re-arms the same way. Normal slow flight cannot
+        // trip it: 12 s of near-zero speed with an unreached destination
+        // and under 0.5 m of movement is not flight, it is a stall.
+        // Fail-open: any read failure resets the window and returns
+        // false -- the stock wall-contact trigger is unaffected.
+        static bool CheckFreeSpaceStall(Robot bot, float gameTime)
+        {
+            try
+            {
+                // Only while guiding toward a goal (see IsGoalSubmode).
+                if (!IsGoalSubmode(Robot.AI_guidebot_submode))
+                {
+                    ResetFreeSpaceWindow();
+                    return false;
+                }
+                Vector3 vel = Vector3.zero;
+                if (s_rigidbodyField != null)
+                {
+                    try
+                    {
+                        Rigidbody rb = (Rigidbody)s_rigidbodyField.GetValue(bot);
+                        if (rb != null)
+                            vel = rb.velocity;
+                    }
+                    catch (Exception) { /* fail-open: vel stays zero, the position check below still guards */ }
+                }
+                Vector3 botPos = bot.transform.position;
+                Vector3 dest = bot.m_next_destination_position;
+                bool still = vel.sqrMagnitude < kFreeStallSpeed * kFreeStallSpeed &&
+                             Vector3.Distance(dest, botPos) > kFreeStallDestDist;
+                if (!still)
+                {
+                    ResetFreeSpaceWindow();
+                    return false;
+                }
+                if (s_freeStallSince < 0f || gameTime < s_freeStallSince)
+                {
+                    // No window open, or the game clock went backward
+                    // (level restart): open a fresh window here.
+                    s_freeStallSince = gameTime;
+                    s_freeStallRefPos = botPos;
+                    return false;
+                }
+                if (Vector3.Distance(botPos, s_freeStallRefPos) >= kFreeStallMove)
+                {
+                    // The bot moved: the stall broke (or it is drifting).
+                    // Re-arm from the new position.
+                    s_freeStallSince = gameTime;
+                    s_freeStallRefPos = botPos;
+                    return false;
+                }
+                if (gameTime - s_freeStallSince < kFreeStallWindow)
+                    return false;
+
+                // Window complete: a 12 s still stall. First, the
+                // forcefield guard -- a bot legitimately waiting at an UP
+                // forcefield is still, far from its destination, and
+                // unmoved, i.e. it looks exactly like a free-space stall.
+                // See IsWaitingAtActiveForcefield: an active forcefield
+                // near the bot suppresses the sensor (re-arm, so it
+                // re-checks after another 12 s if the field is still up).
+                if (IsWaitingAtActiveForcefield(botPos))
+                {
+                    Debug.Log("[GuidebotStuckReturn] free-space sensor suppressed: bot still 12 s but an active forcefield is near (waiting for the field, not wedged); re-arming");
+                    ResetFreeSpaceWindow();
+                    return false;
+                }
+
+                ResetFreeSpaceWindow(); // consume the trigger
+                Debug.Log("[GuidebotStuckReturn] free-space stall: bot still 12 s, |v|=" +
+                    vel.magnitude.ToString("F2", CultureInfo.InvariantCulture) +
+                    ", dest " + dest.ToString() + " " +
+                    Vector3.Distance(dest, botPos).ToString("F1", CultureInfo.InvariantCulture) +
+                    " m away -- running recovery");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotStuckReturn] free-space sensor failed: " + ex.ToString());
+                ResetFreeSpaceWindow();
+                return false;
+            }
+        }
+
+        // True when the bot is pressing against an ACTIVE forcefield: a
+        // Forcefield object is near the bot's position. An active
+        // forcefield is a Forcefield whose GameObject is still active --
+        // Deactivate() calls c_go.SetActive(false), and
+        // FindObjectsOfType only returns active objects, so any
+        // Forcefield found is up (the same API the game itself uses in
+        // DeactivateAllForcefields / UpdateSegmentsForForcefields); the
+        // activeSelf check is a second, explicit guard in case a future
+        // Unity version returns inactive objects too. A bot pressing
+        // against an UP field sits within ~1-2 m of the field prop (it
+        // aims at the portal centre where the prop sits); 6 m is
+        // generous, and the Nov 23 stall sat 23+ m from the field, so
+        // the guard cannot confuse the two. Called only when the sensor
+        // window completes (at most once per 12 s), never every frame,
+        // so the scene-wide search costs nothing in steady flight.
+        // Fail-open toward the recovery: a lookup failure returns false
+        // (the player-position rule in the recovery itself is the second
+        // guard -- a teleport past an UP field needs the player already
+        // ahead of the bot on the route, i.e. already past the field --
+        // and a return only ever brings the bot BACK to the player).
+        static bool IsWaitingAtActiveForcefield(Vector3 botPos)
+        {
+            try
+            {
+                Forcefield[] fields = UnityEngine.Object.FindObjectsOfType<Forcefield>();
+                if (fields == null)
+                    return false;
+                foreach (Forcefield ff in fields)
+                {
+                    if (ff == null || ff.gameObject == null || !ff.gameObject.activeSelf)
+                        continue;
+                    if (Vector3.Distance(botPos, ff.transform.position) < kForcefieldWaitRadius)
+                        return true;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotStuckReturn] forcefield check failed: " + ex.ToString());
+                return false;
+            }
         }
 
         // Teleport-forward: the bot is wedged and the player is AHEAD of it on
