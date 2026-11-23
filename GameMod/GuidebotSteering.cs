@@ -298,6 +298,21 @@ namespace GameMod
             public int To;
         }
 
+        // Glass-route fix (Fix list #5, Nov 22): a BLOCKED leg is a
+        // route leg the GuideBot cannot fly -- solid glass -- with a
+        // baked detour around it. The converter bakes one detour per
+        // glass leg (15-40 segments, no glass legs inside it) and
+        // emits one BLOCKED line per leg; the splice (below) swaps
+        // the detour in for the leg at path-build time. Via holds
+        // the detour's INTERIOR segments in A->B traversal order;
+        // the full detour path is [A, Via..., B].
+        private class BlockedLeg
+        {
+            public int A;
+            public int B;
+            public List<int> Via = new List<int>();
+        }
+
         private class RidgeEntry
         {
             public float ZMin;
@@ -311,6 +326,7 @@ namespace GameMod
         {
             public List<DoorwayEntry> Doorways = new List<DoorwayEntry>();
             public List<RidgeEntry> Ridges = new List<RidgeEntry>();
+            public List<BlockedLeg> BlockedLegs = new List<BlockedLeg>();
         }
 
         // Cached table (per level). A failed load is remembered so the
@@ -814,9 +830,33 @@ namespace GameMod
                 // (the tube loop: nine reversals at the 8->791
                 // portal).
                 int pos = -1;
-                for (int i = 0; i < len; i++)
+                // Duplicate-aware scan (glass-route fix, Nov 22): a
+                // spliced detour can backtrack through a segment the
+                // bot already passed (e.g. the 931->932 detour goes
+                // back through 550, which the bot just came from), so
+                // the path can contain the bot's segment TWICE. The
+                // old first-occurrence scan pinned the index to the
+                // FIRST copy and the bot looped 550<->932 forever.
+                // Search FORWARD from the current index first (the
+                // bot's second pass through the segment), then
+                // BACKWARD (the index ran ahead of the bot -- the
+                // pull-back case, Nov 22) if not found forward.
+                int fwd = idx < 0 ? 0 : idx;
+                for (int i = fwd; i < len; i++)
                 {
                     if (bot.Global_path[i] == cur) { pos = i; break; }
+                }
+                if (pos < 0)
+                {
+                    // Clamp: idx can sit past the end (stock advance);
+                    // the backward scan must stay inside the path.
+                    int back = idx - 1;
+                    if (back > len - 1)
+                        back = len - 1;
+                    for (int i = back; i >= 0; i--)
+                    {
+                        if (bot.Global_path[i] == cur) { pos = i; break; }
+                    }
                 }
                 if (pos >= 0)
                 {
@@ -1393,6 +1433,127 @@ namespace GameMod
             }
         }
 
+        // Glass-route fix (Fix list #5, Nov 22): splice baked detours
+        // for BLOCKED (glass) legs into a freshly built GuideBot path.
+        // The stock pathfinder has no glass concept, so the avoidance
+        // happens here, at path-build time, in the CreatePathToSegment
+        // postfix -- after a NEW path was built (never on a kept-path
+        // skip: a spliced path stays spliced when re-used) and before
+        // the m_target_is_portal reset / any index logic reads it.
+        // One pass over the path's adjacent pairs; each pair matching
+        // a blocked leg (either direction) is replaced by the baked
+        // detour -- forward order [a, v1..vn, b] for a path pair (a,b),
+        // REVERSED [b, vn..v1, a] for a path pair (b,a). A path can
+        // contain several blocked legs (the L1 spawn->key route uses
+        // two); all are replaced in the one pass. Detours contain no
+        // blocked legs (bake guarantee), so no chained re-splice.
+        // Fail-open: a blocked leg with no detour, an empty detour,
+        // or a splice that would overflow Global_path leaves the
+        // stock path untouched and logs once. GuideBot only (the
+        // postfix gates on m_is_guide_bot); every other robot's paths
+        // never reach this code.
+        internal static void SpliceBlockedLegs(Robot bot)
+        {
+            try
+            {
+                if (bot == null || bot.Global_path == null || bot.Global_path_length <= 0)
+                    return;
+                CrossingsTable table = GetTable();
+                if (table == null || table.BlockedLegs.Count == 0)
+                    return;
+                int len = bot.Global_path_length;
+                var path = new List<int>(len);
+                for (int i = 0; i < len; i++)
+                    path.Add(bot.Global_path[i]);
+                List<int> spliced = SpliceBlockedLegsIntoPath(path, table, bot.Global_path.Length);
+                if (object.ReferenceEquals(spliced, path))
+                    return; // unchanged (nothing spliced, or fail-open)
+                for (int i = 0; i < spliced.Count; i++)
+                    bot.Global_path[i] = spliced[i];
+                bot.Global_path_length = spliced.Count;
+            }
+            catch (Exception ex)
+            {
+                // Fail-open: a splice bug must never break pathing --
+                // the stock path stands.
+                Debug.Log("[GuidebotSteering] BLOCKED splice failed: " + ex.ToString());
+            }
+        }
+
+        static BlockedLeg FindBlockedLeg(CrossingsTable table, int a, int b)
+        {
+            foreach (BlockedLeg leg in table.BlockedLegs)
+            {
+                if ((leg.A == a && leg.B == b) || (leg.A == b && leg.B == a))
+                    return leg;
+            }
+            return null;
+        }
+
+        // Pure path rebuild (no Robot access, so it is unit-testable):
+        // returns a NEW list when at least one leg was spliced, the
+        // INPUT list (same reference) when nothing changed or when a
+        // fail-open bail left the stock path untouched. maxLen is the
+        // Global_path array capacity (1000): a splice that would
+        // overflow it returns the input unchanged.
+        // (CS0051: it takes the private CrossingsTable, so it must be
+        // private too -- an internal method may not expose a private
+        // type. The harness extracts it verbatim and calls it from
+        // inside its own wrapper class, so private is no obstacle.)
+        static List<int> SpliceBlockedLegsIntoPath(List<int> path, CrossingsTable table, int maxLen)
+        {
+            if (path == null || path.Count < 2 || table == null || table.BlockedLegs.Count == 0)
+                return path;
+            var outPath = new List<int>(path.Count);
+            outPath.Add(path[0]);
+            bool changed = false;
+            for (int i = 0; i + 1 < path.Count; i++)
+            {
+                int a = path[i], b = path[i + 1];
+                BlockedLeg leg = FindBlockedLeg(table, a, b);
+                if (leg == null)
+                {
+                    outPath.Add(b);
+                    continue;
+                }
+                if (leg.Via.Count == 0)
+                {
+                    Debug.Log("[GuidebotSteering] BLOCKED leg " + leg.A + "<->" + leg.B +
+                        " has no detour -- leaving stock path");
+                    outPath.Add(b);
+                    continue;
+                }
+                changed = true;
+                if (a == leg.A && b == leg.B)
+                {
+                    // Forward: [a, v1..vn, b]; a already appended.
+                    foreach (int v in leg.Via)
+                        outPath.Add(v);
+                    outPath.Add(b);
+                }
+                else
+                {
+                    // Reversed: [b, vn..v1, a]; b (== path[i+1]) is the
+                    // leg's A end, appended last; path[i] (leg.B)
+                    // already appended.
+                    for (int k = leg.Via.Count - 1; k >= 0; k--)
+                        outPath.Add(leg.Via[k]);
+                    outPath.Add(b);
+                }
+                if (outPath.Count > maxLen)
+                {
+                    Debug.Log("[GuidebotSteering] BLOCKED splice would exceed path capacity (" +
+                        outPath.Count + " > " + maxLen + ") -- leaving stock path");
+                    return path;
+                }
+                Debug.Log("[GuidebotSteering] spliced BLOCKED leg " + leg.A + "<->" + leg.B +
+                    ": inserted " + leg.Via.Count + " detour segments");
+            }
+            if (!changed)
+                return path;
+            return outPath;
+        }
+
         static CrossingsTable GetTable()
         {
             string level = null;
@@ -1581,6 +1742,39 @@ namespace GameMod
                     }
                     table.Ridges.Add(rg);
                 }
+                else if (t[0] == "BLOCKED")
+                {
+                    // BLOCKED <a> <b> <v1> <v2> ... <vn>
+                    // Glass leg a<->b (a<b) with a baked detour: the
+                    // full detour path is [a, v1, ..., vn, b].
+                    // Same strictness as the rest of the parser: bad
+                    // ints, or fewer than 2 endpoints, fail the WHOLE
+                    // table (return null). An old table has no BLOCKED
+                    // lines and parses exactly as before.
+                    if (t.Length < 3)
+                    {
+                        Debug.Log("[GuidebotSteering] bad BLOCKED line: " + lines[i]);
+                        return null;
+                    }
+                    var bl = new BlockedLeg();
+                    if (!TryInt(t[1], out bl.A) || !TryInt(t[2], out bl.B))
+                    {
+                        Debug.Log("[GuidebotSteering] bad BLOCKED numbers: " + lines[i]);
+                        return null;
+                    }
+                    for (int k = 3; k < t.Length; k++)
+                    {
+                        int v;
+                        if (!TryInt(t[k], out v))
+                        {
+                            Debug.Log("[GuidebotSteering] bad BLOCKED detour: " + lines[i]);
+                            return null;
+                        }
+                        bl.Via.Add(v);
+                    }
+                    table.BlockedLegs.Add(bl);
+                    i++;
+                }
                 else
                 {
                     Debug.Log("[GuidebotSteering] unknown crossings line: " + lines[i]);
@@ -1728,6 +1922,12 @@ namespace GameMod
                     return;
                 if (Robot_CreatePathToSegment_GuidebotSteering.s_createPathSkipped)
                     return; // re-create skipped: preserve accumulated state
+                // Glass-route fix (Fix list #5, Nov 22): splice baked
+                // BLOCKED-leg detours into the fresh path now, before
+                // the portal-flag reset below / any index logic reads
+                // it. Runs ONLY on a new path (kept-path skips return
+                // above, so a spliced path stays spliced).
+                Robot_DoPathfindMovement_GuidebotSteering.SpliceBlockedLegs(__instance);
                 if (!s_portalFlagLookedUp)
                 {
                     s_portalFlagLookedUp = true;
