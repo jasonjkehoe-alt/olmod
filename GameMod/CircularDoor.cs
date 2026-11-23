@@ -20,11 +20,37 @@
 // so the trigger is proximity (D3's default for doors): open within
 // 3.0 m, close when the player stays beyond 4.5 m for 2.0 s.
 //
+// LOCK (Nov 23, Step 3 fix option A -- D3 DF_LOCKED model, see
+// MATCEN_UPDATE_NOV23.md section 2.1): the controller carries a
+// `Locked` flag (the DF_LOCKED equivalent), consulted in the
+// proximity-open decision -- a locked slab never opens on player
+// proximity. The lock does NOT force-close by itself (D3's
+// DoorwayLockUnlock does not move the door); the separate ForceClose()
+// is the DoorwaySetPosition equivalent, called by the lock path to shut
+// an already-open slab (stock ScriptDoorLock does exactly this:
+// LockType = LOCKED + ForceClose() on a DoorAnimating).
+// Bridge: Overload's door scripts speak only DoorBase
+// (ScriptDoorLock/Unlock GetComponentInChildren<DoorBase>), and the
+// slab has none -- so a Harmony postfix on ScriptDoorLock.ActivateScript
+// (and ScriptDoorUnlock) translates to the controller: the postfix
+// finds the CircularDoorController on each linked carrier GO and sets
+// the flag (+ force-close on lock). A DoorBase adapter was rejected:
+// DoorBase is abstract with engine-side registration (segment, renderers,
+// chunking) and the adapter would NOT be a DoorAnimating, so stock
+// ForceClose would never fire on it -- the postfix is smaller and exact.
+// GB-IGNORE (D3 DF_GB_IGNORE_LOCKED): the GuideBot routes through locked
+// doors by design -- its key route goes through rooms 23/24. A locked
+// slab still opens on GuideBot proximity (Robot.m_guidebot); the player
+// alone can never open it. The player could follow the bot through while
+// it is open for the bot -- the same trade-off D3 accepts.
+//
 // Fail-open: no marker in the .sp (the prop lands with the later batch
 // reconvert) -> nothing is built and the level loads unchanged. A marker
 // with an invalid diameter, or any build error, is logged and skipped.
 // The marker's damage is swallowed (D3 doors are not destroyed by
-// shooting), via the ApplyDamage prefix below.
+// shooting), via the ApplyDamage prefix below. If the lock state is
+// unreadable (no controller on a linked GO, no GuideBot yet, any
+// exception in the postfix), the slab behaves exactly as it does today.
 
 using HarmonyLib;
 using Overload;
@@ -147,6 +173,10 @@ namespace GameMod
 
     // Slides one circular-door slab up on player proximity. Lives on the
     // marker (the carrier); holds the top-level slab by reference.
+    // LOCK (option A): Locked is the D3 DF_LOCKED equivalent -- a locked
+    // slab never opens on player proximity (checked in ShouldOpen).
+    // ForceClose() is the separate D3 DoorwaySetPosition equivalent:
+    // drive the slab to position 0 from wherever it is.
     public class CircularDoorController : MonoBehaviour
     {
         private GameObject m_slab;
@@ -155,6 +185,11 @@ namespace GameMod
         private float m_animT;
         private int m_state; // 0 closed, 1 opening, 2 open, 3 closing
         private float m_farTimer;
+
+        // D3 DF_LOCKED equivalent. Set only via SetLocked (script bridge).
+        public bool Locked { get; private set; }
+
+        public Vector3 ClosedPosition { get { return m_closedPos; } }
 
         public void Init(GameObject slab, float diameter)
         {
@@ -166,6 +201,78 @@ namespace GameMod
             m_state = 0;
             m_animT = 0f;
             m_farTimer = 0f;
+            Locked = false;
+        }
+
+        // D3 DoorwayLockUnlock equivalent: set the flag only, do not move
+        // the slab. The lock path (ScriptDoorLock postfix) calls
+        // ForceClose() separately, mirroring stock ScriptDoorLock
+        // (LockType = LOCKED + ForceClose() on a DoorAnimating).
+        public void SetLocked(bool locked)
+        {
+            if (Locked == locked) return;
+            Locked = locked;
+            Debug.Log("[CircularDoor] " + (locked ? "Locked" : "Unlocked")
+                + " slab at " + m_closedPos + ".");
+        }
+
+        // D3 DoorwaySetPosition equivalent: drive the slab to position 0
+        // (closed) from wherever it is, reversing a mid-open smoothly.
+        // No-op when already closed. Does not check for a ship in the
+        // doorway (D3's auto-close does; ours does not -- small polish
+        // gap, same as a stock DoorAnimating ForceClose()).
+        public void ForceClose()
+        {
+            if (m_slab == null) return;
+            if (m_state == 0) return;
+            float travel = (m_openPos - m_closedPos).magnitude;
+            float f = 0f;
+            if (travel > 0.001f)
+            {
+                f = Mathf.Clamp01(Vector3.Dot(m_slab.transform.position - m_closedPos, Vector3.up) / travel);
+            }
+            if (f <= 0.001f)
+            {
+                m_slab.transform.position = m_closedPos;
+                m_state = 0;
+                m_animT = 0f;
+                m_farTimer = 0f;
+                return;
+            }
+            // Closing lerps Lerp(open, closed, t): the current position
+            // (fraction f from closed) is t = 1 - f.
+            m_state = 3;
+            m_animT = 1f - f;
+            m_farTimer = 0f;
+            Debug.Log("[CircularDoor] Force-closing slab at " + m_closedPos + ".");
+        }
+
+        // D3 DF_GB_IGNORE_LOCKED equivalent: the GuideBot routes through
+        // locked doors by design. Fail-open: no bot (null / destroyed /
+        // any exception) means "no bot near", stock behaviour.
+        private bool GuideBotNear()
+        {
+            try
+            {
+                Robot bot = Robot.m_guidebot;
+                if (bot == null) return false;
+                return Vector3.Distance(bot.transform.position, m_closedPos)
+                    < CircularDoorPatch.kOpenDistance;
+            }
+            catch (System.Exception)
+            {
+                return false;
+            }
+        }
+
+        // The open decision (D3 DoorwayOpenable equivalent): the player
+        // opens only when unlocked; the GuideBot opens regardless of the
+        // lock. A locked slab never opens on player proximity alone.
+        private bool ShouldOpen(float playerDist)
+        {
+            bool playerNear = playerDist < CircularDoorPatch.kOpenDistance;
+            if (playerNear && !Locked) return true;
+            return GuideBotNear();
         }
 
         void Update()
@@ -177,7 +284,7 @@ namespace GameMod
 
             if (m_state == 0) // closed
             {
-                if (dist < CircularDoorPatch.kOpenDistance)
+                if (ShouldOpen(dist))
                 {
                     m_state = 1;
                     m_animT = 0f;
@@ -211,7 +318,9 @@ namespace GameMod
             else // closing
             {
                 // Player came back mid-close: reverse smoothly from here.
-                if (dist < CircularDoorPatch.kOpenDistance)
+                // Locked slabs do not reverse for the player, only for
+                // the GuideBot (ShouldOpen encodes both rules).
+                if (ShouldOpen(dist))
                 {
                     m_state = 1;
                     m_animT = 1f - Mathf.Clamp01(m_animT);
@@ -252,6 +361,84 @@ namespace GameMod
                 Debug.Log("[CircularDoor] ApplyDamage prefix failed (fail open to stock): " + ex.ToString());
             }
             return true;
+        }
+    }
+
+    // Step 3 lock bridge (option A): the door scripts speak only DoorBase
+    // (ScriptDoorLock/Unlock do GetComponentInChildren<DoorBase> on each
+    // linked GO; a circular carrier has none, so stock silently skips
+    // it). These postfixes translate the script to the slab: for each
+    // linked GO that carries a CircularDoorController (i.e. a circular
+    // marker), drive the controller. Chosen over a DoorBase adapter:
+    // DoorBase is abstract with engine-side registration (segment,
+    // renderers, chunking) and an adapter would not be a DoorAnimating,
+    // so stock ForceClose() would never fire on it -- the postfix calls
+    // the controller's lock + force-close directly, and touches nothing
+    // in the engine's door system. Fail-open everywhere: a linked GO
+    // without a controller is ignored (stock behaviour), and any
+    // exception leaves the slab exactly as it is.
+    //
+    // Semantics mirror stock exactly:
+    // - Lock (DOOR_LOCK): SetLocked(true) + ForceClose() -- stock
+    //   ScriptDoorLock sets LockType = LOCKED and calls ForceClose()
+    //   on a DoorAnimating. This is the login sequence's close: the
+    //   slab shuts and stays shut.
+    // - Unlock (DOOR_CLOSE, which the editor maps to
+    //   entity_script_door_unlock): SetLocked(false) only -- stock
+    //   ScriptDoorUnlock sets LockType = NONE and does not move the
+    //   door. NOTE the DOOR_CLOSE entities never fire in the base game
+    //   either: ScriptDoorLock never forwards ActivateScriptLink to its
+    //   link1/link3, so they are dormant wiring kept for completeness;
+    //   the actual close in the login sequence is the lock's
+    //   ForceClose() above, not these scripts.
+    [HarmonyPatch(typeof(ScriptDoorLock), "ActivateScript")]
+    public static class CircularDoorLockPatch
+    {
+        static void Postfix(ScriptDoorLock __instance)
+        {
+            try
+            {
+                if (__instance == null) return;
+                foreach (GameObject go in __instance.c_go_link)
+                {
+                    if (go == null) continue;
+                    CircularDoorController ctl = go.GetComponent<CircularDoorController>();
+                    if (ctl == null) continue;
+                    ctl.SetLocked(true);
+                    ctl.ForceClose();
+                    Debug.Log("[CircularDoor] Lock script locked + force-closed slab at "
+                        + ctl.ClosedPosition + ".");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[CircularDoor] ScriptDoorLock postfix failed (fail open, slab unchanged): " + ex.ToString());
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(ScriptDoorUnlock), "ActivateScript")]
+    public static class CircularDoorUnlockPatch
+    {
+        static void Postfix(ScriptDoorUnlock __instance)
+        {
+            try
+            {
+                if (__instance == null) return;
+                foreach (GameObject go in __instance.c_go_link)
+                {
+                    if (go == null) continue;
+                    CircularDoorController ctl = go.GetComponent<CircularDoorController>();
+                    if (ctl == null) continue;
+                    ctl.SetLocked(false);
+                    Debug.Log("[CircularDoor] Unlock script unlocked slab at "
+                        + ctl.ClosedPosition + ".");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Debug.Log("[CircularDoor] ScriptDoorUnlock postfix failed (fail open, slab unchanged): " + ex.ToString());
+            }
         }
     }
 }
