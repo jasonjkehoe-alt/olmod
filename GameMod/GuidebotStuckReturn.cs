@@ -1,6 +1,7 @@
 using HarmonyLib;
 using Overload;
 using System;
+using System.Globalization;
 using System.Reflection;
 using UnityEngine;
 
@@ -186,6 +187,33 @@ namespace GameMod
                 submode == AIGuidebotSubmodeType.NAPPING ||
                 submode == AIGuidebotSubmodeType.START)
                 return;
+
+            // Late-fire guard (Nov 23, c0472d38 flight): the stock
+            // counter can stay over 50 while the bot is sliding along
+            // a slope it already freed itself from (lines 13687-13691:
+            // |v| 2.29-2.54, stay 9-17, StuckReturn fired at 13690
+            // anyway and teleported a moving bot). A bot that is
+            // actually moving is not wedged: defer (the episode
+            // counter was already zeroed above, so the count rebuilds
+            // only if it wedges again) instead of firing. Threshold
+            // 1.0 m/s: the freed bot was at 2.3+, a wedged bot sits
+            // near 0. Fail-open: a missing rigidbody (or any read
+            // failure) proceeds with the recovery as before.
+            if (s_rigidbodyField != null)
+            {
+                try
+                {
+                    Rigidbody rb = (Rigidbody)s_rigidbodyField.GetValue(__instance);
+                    if (rb != null && rb.velocity.magnitude > 1.0f)
+                    {
+                        Debug.Log("[GuidebotStuckReturn] deferring recovery: bot moving |v|=" +
+                            rb.velocity.magnitude.ToString("F2", CultureInfo.InvariantCulture) +
+                            " -- freed itself, not wedged");
+                        return;
+                    }
+                }
+                catch (Exception) { /* fail-open: proceed with recovery */ }
+            }
 
             float gameTime = (float)GameplayManager.m_game_time;
 

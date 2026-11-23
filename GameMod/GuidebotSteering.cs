@@ -257,6 +257,65 @@ namespace GameMod
     // index) whenever it changes, so the next flight's log shows the
     // destination directly.
     //
+    // Fixes A-D (Nov 23) -- the c0472d38 flight diagnosis
+    // (docs/reports/guidebot-c0472d38-flight-diagnosis.md). Four
+    // code-proven bugs, each fixed where it lives:
+    //   (A) HoldPortalLine exits on every m_target_is_portal==true
+    //       frame because ResyncPathIndex pins the index to pos+1
+    //       first, so the hold reads the NEXT leg (cur != fromSeg)
+    //       and returns early. Fix: ResyncPathIndex clears a STALE
+    //       portal flag -- one whose active portal destination does
+    //       not belong to the leg the bot is actually traversing --
+    //       so the pin lands on pos and the hold can fire.
+    //   (B) HoldPortalLine reads the leg from Global_path_index.
+    //       Fix: it scans Global_path for the bot's segment (the
+    //       same duplicate-aware scan ResyncPathIndex uses, shared
+    //       as FindRoutePosition), and Case B pushes along the
+    //       PORTAL NORMAL, not (toCentre - pc) -- the old direction
+    //       pushed sideways into the jamb at 28->1706 (mostly up,
+    //       barely past the plane). Crossings are hand-out geometry
+    //       only: no waypoint is ever seeded at a crossing point in
+    //       the route network. Single-point doorways parked the bot
+    //       ON the plane and multi-waypoint doorways aborted 2.0 m
+    //       early (kWaypointReach): the crossing now has its own
+    //       tighter reach (kCrossingReach, 0.75 m) and, once the bot
+    //       is within 1.5 m of it, the aim becomes crossing +
+    //       portal-normal * 1.5 (push-through), in both the movement
+    //       prefix and the Case A hold.
+    //   (C) Outdoor aims under the terrain: the 1437 z=512 stall is
+    //       a portal centre 3.78 m under the hill with no baked
+    //       crossing. Fix: a general terrain-clearance lift -- when
+    //       the destination sits in a terrain cube, a downward
+    //       raycast lifts it to ground + 2.5 m (never down, capped
+    //       at +20 m) -- plus off-route scoring by XZ distance when
+    //       the bot is in a terrain cube, so a high cube is not
+    //       skipped for a lower nearer-centre cube. The lift runs in
+    //       the DoPathFollow postfix (after HoldPortalLine, before
+    //       LogDestination), so it covers stock destinations too.
+    //       New crossings are baked with a TERH-aware validator
+    //       (the unsigned sweep alone cannot see "under the hill").
+    //   (D) GuideBotLeadPlayer stomps the destination to the
+    //       route-origin centre on kept-path skips (decompile
+    //       GuideBotLeadPlayer TO_GOAL case: after CreatePathToSegment
+    //       returns true it sets dest = Segments[Global_path[0]].
+    //       Center -- including when our prefix skipped the
+    //       re-create). Fix: the LeadPlayer patch saves the
+    //       destination on entry and restores it in the postfix when
+    //       the path was kept and the dest was stomped. Two recovery
+    //       defects from the same diagnosis ride along:
+    //       RepairStaleDestination now repairs at pos 0 too (the old
+    //       pos > 0 guard stranded the bot aiming at its own centre),
+    //       and GuidebotStuckReturn defers when the bot is actually
+    //       moving (|v| > 1.0 m/s) instead of teleporting a bot that
+    //       already freed itself.
+    //   Matcen (Nov 23) press diagnostic: the stuck-watch line now
+    //   names the goal source, the live steer target, and the
+    //   nearest doorway / portal state, so a press names its cause.
+    //   The Matcen rung numbers (6.7 / 6.42 / 5.36, depths 24/16/8/4,
+    //   tight penalty 40) are D3 ship-scale references only -- our
+    //   bot is a 0.60 m sphere, so no constant was copied; the
+    //   crossings are validated at r=0.60 by sweep (+ TERH outdoors).
+    //
     // Fail-open: no table, unreadable table, or no matching entry -> the
     // stock destination is used unchanged. Only the GuideBot is affected
     // (m_is_guide_bot gate); every other robot is untouched, as are the
@@ -338,6 +397,21 @@ namespace GameMod
         private static string s_lastDest;
 
         private const float kWaypointReach = 2.0f;
+
+        // Fixes A-D (Nov 23), bug (2): a waypoint is "passed" at
+        // kWaypointReach, so a multi-waypoint doorway aborted 2.0 m
+        // early -- the crossing was "passed" before the bot crossed
+        // the plane, the sequence ended, and the stock flip resumed.
+        // The crossing itself needs a tighter reach (just past the
+        // bot's 0.60 m radius): 0.75 m. Approach waypoints keep 2.0 m.
+        private const float kCrossingReach = 0.75f;
+
+        // Fixes A-D (Nov 23), bug (2): once the bot is this close to a
+        // crossing, the aim becomes crossing + portal-normal * 1.5 --
+        // a sustained push THROUGH the plane instead of parking on it
+        // (single-point doorways) or handing back to stock early.
+        private const float kPushThroughRange = 1.5f;
+        private const float kPushThroughDistance = 1.5f;
 
         // Ridge proximity guard (Nov 22, d4491740 flight): the ridge
         // rule used to fire on the z-band alone, anywhere in the level
@@ -465,6 +539,26 @@ namespace GameMod
                 string kind;
                 if (TryDoorwayDestination(dw, fwd, botPos, out dest, out kind))
                 {
+                    // Fixes A-D (Nov 23), bug (2): a single-point
+                    // doorway parked the bot ON the portal plane -- the
+                    // aim was the crossing itself, and the stock
+                    // advance needs the bot through the plane, not on
+                    // it. Within push-through range of the crossing,
+                    // aim 1.5 m beyond the plane along the portal
+                    // normal (the same point HoldPortalLine Case A
+                    // asserts), so the bot gets a sustained push
+                    // through instead of sitting on the crossing.
+                    // Fail-open: no portal normal -> keep the crossing.
+                    if (kind == "doorway-crossing" &&
+                        Vector3.Distance(botPos, dest) < kPushThroughRange)
+                    {
+                        Vector3 normal;
+                        if (GetPortalNormal(fromSeg, toSeg, out normal))
+                        {
+                            dest = dest + normal * kPushThroughDistance;
+                            kind = "doorway-push-through";
+                        }
+                    }
                     SetDestination(__instance, dest, kind + " " + fromSeg + "->" + toSeg);
                     return;
                 }
@@ -731,8 +825,7 @@ namespace GameMod
         // to seg 26 or the terrain. The stock follower's next branch-6
         // match re-derives the destination forward from here, so the
         // repair only has to break the stale-origin lock for one
-        // frame. Guarded to pos > 0 (at the origin the destination is
-        // legitimately the origin centre) and to a 0.5 m match (the
+        // frame. Guarded to a 0.5 m match (the
         // destination is a point the stock code set, so an exact
         // centre match is expected; the tolerance covers float
         // rounding, not a different point). A portal centre that
@@ -740,19 +833,31 @@ namespace GameMod
         // the same way -- the forward destination is what the stock
         // follower would set on the next match anyway. Fail-open: a
         // repair bug leaves the stock destination unchanged.
+        // Recovery defect (a) (Nov 23, c0472d38 flight): the old
+        // pos > 0 guard left the bot stranded at pos 0 aiming at its
+        // own segment centre (the 28->1706 stall began with a stale
+        // dest at pos 0). At the origin the destination IS
+        // legitimately the origin centre -- but only while the bot is
+        // near it. When the bot is more than 2.0 m from its own
+        // centre, the destination is stale (a kept-path skip stomped
+        // it there, or InitPath set it and the follower never
+        // re-derived it): resolve forward to the next route segment's
+        // centre. Within 2.0 m the stock follower owns it -- the
+        // repair leaves it alone.
         // Internal (not private): ResyncPathIndex calls it from the
         // on-route branch, after the index pin.
         internal static void RepairStaleDestination(Robot bot, int pos, int len)
         {
             try
             {
-                if (pos <= 0)
+                if (pos < 0)
                     return;
                 LevelData ld = null;
                 try { ld = GameManager.m_level_data; } catch (Exception) { }
                 if (ld == null || ld.Segments == null)
                     return;
                 Vector3 dest = bot.m_next_destination_position;
+                Vector3 botPos = bot.transform.position;
                 int behind = -1;
                 for (int i = 0; i < pos; i++)
                 {
@@ -763,6 +868,18 @@ namespace GameMod
                     {
                         behind = i;
                         break;
+                    }
+                }
+                if (behind < 0 && pos == 0 && len > 1)
+                {
+                    // Recovery defect (a): pos 0, destination is the
+                    // bot's own segment centre, bot far from it.
+                    int origin = bot.Global_path[0];
+                    if (origin >= 0 && origin < ld.Segments.Length &&
+                        (dest - ld.Segments[origin].Center).sqrMagnitude <= 0.25f &&
+                        Vector3.Distance(botPos, dest) > 2.0f)
+                    {
+                        behind = 0;
                     }
                 }
                 if (behind < 0)
@@ -782,6 +899,91 @@ namespace GameMod
             catch (Exception ex)
             {
                 Debug.Log("[GuidebotSteering] stale-destination repair failed: " + ex.ToString());
+            }
+        }
+
+        // Duplicate-aware route-position scan (glass-route fix, Nov 22):
+        // a spliced detour can backtrack through a segment the bot
+        // already passed, so the path can contain the bot's segment
+        // TWICE. Search FORWARD from the current index first (the
+        // bot's second pass through the segment), then BACKWARD (the
+        // index ran ahead of the bot -- the pull-back case) if not
+        // found forward. Shared by ResyncPathIndex and HoldPortalLine
+        // (Fix B, Nov 23): both must read the leg the bot is actually
+        // traversing, not the leg the index happens to point at.
+        // Returns the path position of `cur`, or -1 when the bot's
+        // segment is not on the route at all.
+        internal static int FindRoutePosition(Robot bot, int cur, int startIdx)
+        {
+            int len = bot.Global_path_length;
+            int fwd = startIdx < 0 ? 0 : startIdx;
+            for (int i = fwd; i < len; i++)
+            {
+                if (bot.Global_path[i] == cur) { return i; }
+            }
+            // Clamp: startIdx can sit past the end (stock advance);
+            // the backward scan must stay inside the path.
+            int back = startIdx - 1;
+            if (back > len - 1)
+                back = len - 1;
+            for (int i = back; i >= 0; i--)
+            {
+                if (bot.Global_path[i] == cur) { return i; }
+            }
+            return -1;
+        }
+
+        // Fix A (Nov 23) -- clear a stale m_target_is_portal. The
+        // portal-aware pull-back pins the index to pos+1 while the
+        // flag is true, on the assumption that the active portal
+        // destination belongs to the leg the bot is traversing. When
+        // the flag survives a goal flip / path rebuild / index
+        // runaway, the destination is a portal (or next-centre) point
+        // from some OTHER leg, and the pin puts the index one leg
+        // ahead -- so HoldPortalLine reads the next leg, finds
+        // cur != fromSeg, and exits on every portal-aim frame (the
+        // 1442->1437 and 42->807 holds fired 0x in the c0472d38
+        // flight). The flag belongs to the traversing leg only when
+        // the destination IS that leg's portal centre or its next
+        // segment's centre (within 0.5 m, the same tolerance the hold
+        // uses); otherwise it is stale and is cleared, so the pin
+        // lands on pos and the hold can fire. Fail-open: when the
+        // portal centre cannot be computed, the flag is left alone.
+        // Internal (not private): ResyncPathIndex calls it.
+        internal static void ClearStalePortalFlag(Robot bot, int pos)
+        {
+            try
+            {
+                if (!GetTargetIsPortal(bot))
+                    return;
+                int len = bot.Global_path_length;
+                Vector3 dest = bot.m_next_destination_position;
+                // No next leg: there is no portal destination to hold.
+                if (pos + 1 >= len)
+                {
+                    SetTargetIsPortal(bot, false);
+                    Debug.Log("[GuidebotSteering] stale portal flag cleared: bot at path pos " + pos + " (last segment), no next leg");
+                    return;
+                }
+                int fromSeg = bot.Global_path[pos];
+                int toSeg = bot.Global_path[pos + 1];
+                Vector3 pc;
+                if (!GetPortalCentre(bot, fromSeg, toSeg, out pc))
+                    return; // cannot verify -- fail-open, leave the flag
+                bool atPortal = Vector3.Distance(dest, pc) < 0.5f;
+                bool atNext = false;
+                Vector3 toCentre;
+                if (TryGetSegmentCentre(toSeg, out toCentre))
+                    atNext = Vector3.Distance(dest, toCentre) < 0.5f;
+                if (atPortal || atNext)
+                    return; // belongs to the traversing leg -- keep the flag
+                SetTargetIsPortal(bot, false);
+                Debug.Log("[GuidebotSteering] stale portal flag cleared: dest " + dest.ToString() +
+                    " is not the " + fromSeg + "->" + toSeg + " portal/next centre (bot at path pos " + pos + ")");
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] stale portal flag check failed: " + ex.ToString());
             }
         }
 
@@ -830,36 +1032,16 @@ namespace GameMod
                 // (the tube loop: nine reversals at the 8->791
                 // portal).
                 int pos = -1;
-                // Duplicate-aware scan (glass-route fix, Nov 22): a
-                // spliced detour can backtrack through a segment the
-                // bot already passed (e.g. the 931->932 detour goes
-                // back through 550, which the bot just came from), so
-                // the path can contain the bot's segment TWICE. The
-                // old first-occurrence scan pinned the index to the
-                // FIRST copy and the bot looped 550<->932 forever.
-                // Search FORWARD from the current index first (the
-                // bot's second pass through the segment), then
-                // BACKWARD (the index ran ahead of the bot -- the
-                // pull-back case, Nov 22) if not found forward.
-                int fwd = idx < 0 ? 0 : idx;
-                for (int i = fwd; i < len; i++)
-                {
-                    if (bot.Global_path[i] == cur) { pos = i; break; }
-                }
-                if (pos < 0)
-                {
-                    // Clamp: idx can sit past the end (stock advance);
-                    // the backward scan must stay inside the path.
-                    int back = idx - 1;
-                    if (back > len - 1)
-                        back = len - 1;
-                    for (int i = back; i >= 0; i--)
-                    {
-                        if (bot.Global_path[i] == cur) { pos = i; break; }
-                    }
-                }
+                // Duplicate-aware scan (glass-route fix, Nov 22) --
+                // shared as FindRoutePosition (Fix B uses it too).
+                pos = FindRoutePosition(bot, cur, idx);
                 if (pos >= 0)
                 {
+                    // Fix A (Nov 23): clear a stale portal flag BEFORE
+                    // the pin below decides its target -- a stale flag
+                    // would pin the index to pos+1 and HoldPortalLine
+                    // would exit on every portal-aim frame.
+                    ClearStalePortalFlag(bot, pos);
                     // Portal-aware pull-back (Nov 22, e5a796ff
                     // flight): when the bot is aiming at a portal
                     // centre (m_target_is_portal true), the target
@@ -939,13 +1121,34 @@ namespace GameMod
                     return;
                 int best = -1;
                 float bestD2 = float.MaxValue;
+                // Fix C (Nov 23): when the bot is off-route in a
+                // terrain cube, score route segments by HORIZONTAL
+                // (XZ) distance, not 3D. Terrain-cube centres sit low
+                // (y~36-40) while the bot flies high (y~50+); 3D
+                // distance picks a lower nearer-centre cube over the
+                // cube the bot is actually above, and the resync
+                // pulls it down. XZ scoring asks "where am I on the
+                // route", and the terrain lift (LiftDestinationFor-
+                // Terrain) handles the height. Indoors the 3D score
+                // stands (segment centres are the route there).
+                bool botInTerrain = IsTerrainCube(cur);
                 for (int i = 0; i < len; i++)
                 {
                     int seg = bot.Global_path[i];
                     if (seg < 0 || seg >= ld.Segments.Length)
                         continue;
                     Vector3 c = ld.Segments[seg].Center;
-                    float d2 = (botPos - c).sqrMagnitude;
+                    float d2;
+                    if (botInTerrain)
+                    {
+                        float dx = botPos.x - c.x;
+                        float dz = botPos.z - c.z;
+                        d2 = dx * dx + dz * dz;
+                    }
+                    else
+                    {
+                        d2 = (botPos - c).sqrMagnitude;
+                    }
                     if (d2 < bestD2) { bestD2 = d2; best = i; }
                 }
                 if (best < 0)
@@ -967,6 +1170,85 @@ namespace GameMod
                 // Fail-open: a resync bug must never break pathing --
                 // the stock destination is used unchanged.
                 Debug.Log("[GuidebotSteering] resync failed: " + ex.ToString());
+            }
+        }
+
+        // Press diagnostic (Matcen, Nov 23): while a bot presses (>1 s
+        // at near-zero speed under thrust), D3 logs the goal source,
+        // the live steer target, and the nearest locked door in the
+        // room -- so an observed press names its cause. The stuck-watch
+        // IS our press detector (nearly still, destination > 1 m away,
+        // throttled to ~1 s). This names the same three things with
+        // the data we have: the goal source (AI_guidebot_submode +
+        // the path goal), the live steer target (the dest + portal
+        // flag + index, already on the line -- here the traversing leg
+        // and its portal state), and the nearest doorway entry (we
+        // have no lock concept in GameMod -- the ring-door lock is a
+        // separate job -- so the nearest baked doorway crossing is
+        // the closest equivalent: a press AT a doorway names the
+        // doorway, a press far from any doorway names geometry).
+        // Fail-open: any lookup failure yields "?" fields, never a
+        // throw (this runs inside the logging path).
+        static string PressDiagnostic(Robot bot, Vector3 dest)
+        {
+            try
+            {
+                string goal = "?";
+                try { goal = Robot.AI_guidebot_submode.ToString(); } catch (Exception) { }
+                int pathGoal = -1;
+                try
+                {
+                    if (bot.Global_path != null && bot.Global_path_length > 0)
+                        pathGoal = bot.Global_path[bot.Global_path_length - 1];
+                }
+                catch (Exception) { }
+                int cur = bot.m_current_segment;
+                int idx = bot.Global_path_index;
+                string leg = "off-route";
+                string portalState = "n/a";
+                try
+                {
+                    int pos = FindRoutePosition(bot, cur, idx);
+                    if (pos >= 0 && pos + 1 < bot.Global_path_length)
+                    {
+                        int fromSeg = bot.Global_path[pos];
+                        int toSeg = bot.Global_path[pos + 1];
+                        leg = fromSeg + "->" + toSeg;
+                        Vector3 pc;
+                        if (GetPortalCentre(bot, fromSeg, toSeg, out pc))
+                        {
+                            portalState = Vector3.Distance(bot.transform.position, pc).ToString("F1", CultureInfo.InvariantCulture) + "m from portal";
+                        }
+                    }
+                }
+                catch (Exception) { }
+                string doorway = "none";
+                try
+                {
+                    CrossingsTable table = GetTable();
+                    if (table != null && table.Doorways.Count > 0)
+                    {
+                        float best = float.MaxValue;
+                        DoorwayEntry bestDw = null;
+                        foreach (DoorwayEntry e in table.Doorways)
+                        {
+                            float d = Vector3.Distance(bot.transform.position, e.Crossing);
+                            if (d < best) { best = d; bestDw = e; }
+                        }
+                        if (bestDw != null)
+                        {
+                            doorway = bestDw.From + "->" + bestDw.To + " " +
+                                best.ToString("F1", CultureInfo.InvariantCulture) + "m";
+                        }
+                    }
+                }
+                catch (Exception) { }
+                return "press goal=" + goal + "/" + pathGoal + " leg=" + leg +
+                    " nearest-doorway=" + doorway + " portal=" + portalState;
+            }
+            catch (Exception)
+            {
+                return "press goal=? leg=? nearest-doorway=? portal=?";
             }
         }
 
@@ -1019,7 +1301,8 @@ namespace GameMod
                             ", seg=" + cur + ") from " + bot.transform.position.ToString() +
                             " vel " + vel.ToString() + " |v|=" +
                             vel.magnitude.ToString("F2", CultureInfo.InvariantCulture) +
-                            " robot_stay=" + robotStay + " stay=" + stay);
+                            " robot_stay=" + robotStay + " stay=" + stay +
+                            " " + PressDiagnostic(bot, dest));
                     }
                     return;
                 }
@@ -1107,12 +1390,25 @@ namespace GameMod
                 int len = bot.Global_path_length;
                 int idx = bot.Global_path_index;
                 int cur = bot.m_current_segment;
-                if (cur < 0 || idx < 0 || idx + 1 >= len)
+                if (cur < 0 || idx < 0 || idx >= len)
                     return;
-                int fromSeg = bot.Global_path[idx];
-                int toSeg = bot.Global_path[idx + 1];
-                if (cur != fromSeg)
+                // Fix B (Nov 23): the leg is the leg the bot is
+                // TRAVERSING -- its own route position to the next
+                // route segment -- read by scanning Global_path for
+                // the bot's segment (FindRoutePosition), NOT from
+                // Global_path_index. The old index read plus the
+                // cur != fromSeg early return meant the hold exited
+                // on every frame where ResyncPathIndex had pinned the
+                // index to pos+1 (every m_target_is_portal==true
+                // frame): the 1442->1437 and 42->807 holds fired 0x
+                // in the c0472d38 flight. The scan is duplicate-aware
+                // (same as the resync), so a spliced detour's second
+                // pass through a segment reads the right leg.
+                int pos = FindRoutePosition(bot, cur, idx);
+                if (pos < 0 || pos + 1 >= len)
                     return;
+                int fromSeg = bot.Global_path[pos];
+                int toSeg = bot.Global_path[pos + 1];
                 Vector3 botPos = bot.transform.position;
                 Vector3 dest = bot.m_next_destination_position;
                 Vector3 pc;
@@ -1131,6 +1427,12 @@ namespace GameMod
                 }
                 Vector3 toCentre;
                 bool haveToCentre = TryGetSegmentCentre(toSeg, out toCentre);
+                // Portal normal (Fix B): the direction through the
+                // plane toward the next segment, from the shared
+                // portal quad. Fail-open to "unknown" -- the cases
+                // below fall back to their old behaviour without it.
+                Vector3 portalNormal;
+                bool haveNormal = GetPortalNormal(fromSeg, toSeg, out portalNormal);
                 // Case A -- doorway hold.
                 if (dw != null)
                 {
@@ -1139,8 +1441,24 @@ namespace GameMod
                         Vector3.Distance(dest, toCentre) < 0.5f;
                     if (atPortal || atNext)
                     {
-                        SetDestination(bot, dw.Crossing,
-                            "portal-crossing doorway-hold " + fromSeg + "->" + toSeg);
+                        // Fix B, bug (2): once the bot is within
+                        // push-through range of the crossing, aim
+                        // 1.5 m beyond the plane along the portal
+                        // normal instead of parking on the crossing.
+                        // (The movement prefix does the same when it
+                        // stages the crossing; this covers the frames
+                        // where the prefix has handed control back.)
+                        if (haveNormal &&
+                            Vector3.Distance(botPos, dw.Crossing) < kPushThroughRange)
+                        {
+                            SetDestination(bot, dw.Crossing + portalNormal * kPushThroughDistance,
+                                "portal-crossing doorway-push-through " + fromSeg + "->" + toSeg);
+                        }
+                        else
+                        {
+                            SetDestination(bot, dw.Crossing,
+                                "portal-crossing doorway-hold " + fromSeg + "->" + toSeg);
+                        }
                         return;
                     }
                     // Else fall through to case C (MaybeAdvance clamp).
@@ -1153,12 +1471,33 @@ namespace GameMod
                         !GetTargetIsPortal(bot) &&
                         Vector3.Distance(botPos, pc) < 1.0f)
                     {
-                        Vector3 dir = toCentre - pc;
-                        if (dir.sqrMagnitude < 1e-6f)
-                            dir = toCentre - botPos;
-                        if (dir.sqrMagnitude < 1e-6f)
-                            return;
-                        dir.Normalize();
+                        // Fix B, bug (3): push along the PORTAL
+                        // NORMAL, not (toCentre - pc). The old
+                        // direction is the line from the portal
+                        // centre to the next segment's centre, which
+                        // at 28->1706 pointed mostly UP (+1.41 m in
+                        // y, only -0.51 m in z) -- sideways into the
+                        // jamb, barely 0.1 m past the plane -- while
+                        // Case C pulled down to the portal centre and
+                        // the stock dest pulled at 1706's centre: a
+                        // three-way limit cycle. The normal is the
+                        // direction through the plane. Fall back to
+                        // the old direction only when the quad cannot
+                        // be read.
+                        Vector3 dir;
+                        if (haveNormal)
+                        {
+                            dir = portalNormal;
+                        }
+                        else
+                        {
+                            dir = toCentre - pc;
+                            if (dir.sqrMagnitude < 1e-6f)
+                                dir = toCentre - botPos;
+                            if (dir.sqrMagnitude < 1e-6f)
+                                return;
+                            dir.Normalize();
+                        }
                         SetDestination(bot, pc + dir * 1.5f,
                             "portal-crossing " + fromSeg + "->" + toSeg);
                         return;
@@ -1175,7 +1514,7 @@ namespace GameMod
                     }
                     if (nearDoorway)
                     {
-                        for (int i = idx + 2; i < len; i++)
+                        for (int i = pos + 2; i < len; i++)
                         {
                             Vector3 far;
                             if (!TryGetSegmentCentre(bot.Global_path[i], out far))
@@ -1194,6 +1533,75 @@ namespace GameMod
             catch (Exception ex)
             {
                 Debug.Log("[GuidebotSteering] HoldPortalLine failed: " + ex.ToString());
+            }
+        }
+
+        // Fix C (Nov 23) -- general terrain-clearance lift on outdoor
+        // aims. The 1437 z=512 stall is a portal centre 3.78 m under
+        // the hill: the stock destination is a buried point, the bot
+        // beaches on the slope edge (stay climbing to 50), and no
+        // baked crossing exists for that leg. The lift is general,
+        // not per-leg: whenever the destination sits in an outdoor
+        // terrain cube, a downward raycast from 40 m above it finds
+        // the ground, and the destination is raised to ground + 2.5 m
+        // (bot radius 0.60 + 1.9 m of air). It only ever lifts UP
+        // (never pushes a destination down), and caps at +20 m so a
+        // bogus ray cannot fling the bot into the sky. The
+        // destination-segment guard is what makes the ray safe: a
+        // terrain cube is open-top, so the first hit below the ray
+        // start IS the ground -- there is no ceiling above the dest
+        // to confuse it (the 42->807 doorway roof is exactly the case
+        // the guard excludes: neither 42 nor 807 is a terrain cube).
+        // The portal flag is cleared (the lifted point is a
+        // free-space point, not a portal point -- the same rationale
+        // as RepairStaleDestination). Runs in the DoPathFollow
+        // postfix, after HoldPortalLine and before LogDestination, so
+        // it covers stock destinations as well as overrides, and the
+        // log records the lifted destination. Validated crossings sit
+        // above ground + 2.5 m already (1442->1437: ground + 2.07 m
+        // clearance means ground + 2.5 = crossing - 0.43 m, no lift),
+        // so the lift does not fight the table. Fail-open: no ray hit
+        // (or any exception) leaves the stock destination alone.
+        // Internal (not private): the DoPathFollow postfix calls it.
+        internal static void LiftDestinationForTerrain(Robot bot)
+        {
+            try
+            {
+                if (bot.Global_path == null || bot.Global_path_length <= 0)
+                    return;
+                int cur = bot.m_current_segment;
+                if (cur < 0)
+                    return;
+                Vector3 dest = bot.m_next_destination_position;
+                // Destination must sit in a terrain cube (see above).
+                int destSeg = -1;
+                try
+                {
+                    LevelData ld = GameManager.m_level_data;
+                    if (ld != null)
+                        destSeg = ld.FindSegmentContainingWorldPosition(dest, cur);
+                }
+                catch (Exception) { }
+                if (destSeg < 0 || !IsTerrainCube(destSeg))
+                    return;
+                Vector3 origin = dest + new Vector3(0f, 40f, 0f);
+                int mask = ~(1 << 11); // everything except the robot layer
+                RaycastHit hit;
+                if (!Physics.Raycast(origin, Vector3.down, out hit, 80f, mask,
+                    QueryTriggerInteraction.Ignore))
+                    return; // no ground under the dest: leave it alone
+                float lifted = hit.point.y + 2.5f;
+                if (lifted <= dest.y || lifted > dest.y + 20f)
+                    return;
+                Vector3 liftedDest = new Vector3(dest.x, lifted, dest.z);
+                bot.m_next_destination_position = liftedDest;
+                SetTargetIsPortal(bot, false); // a free-space point, not a portal point
+                SetDestination(bot, liftedDest,
+                    "terrain-lift seg " + cur + " dest-seg " + destSeg);
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] terrain lift failed: " + ex.ToString());
             }
         }
 
@@ -1275,6 +1683,88 @@ namespace GameMod
             }
         }
 
+        // Portal normal (Fix B, Nov 23): the unit direction through
+        // the portal shared by two segments, pointing from fromSeg
+        // toward toSeg. Same side-finding as GetPortalCentre (the
+        // first side whose portal index matches a side of the other
+        // segment), kept as a parallel method so GetPortalCentre --
+        // verified by flight logs -- stays byte-identical. The normal
+        // is the Newell normal of the shared quad (cross of the
+        // diagonals would do for a rectangle, but the quad may be a
+        // general quadrilateral); it is flipped when it points away
+        // from the next segment's centre. Degenerate quads (zero
+        // area, or a to-centre that coincides with the portal centre)
+        // return false -- the callers fall back to the old
+        // centre-to-centre direction. Fail-open on any exception.
+        static bool GetPortalNormal(int fromSeg, int toSeg, out Vector3 normal)
+        {
+            normal = Vector3.zero;
+            try
+            {
+                LevelData ld = null;
+                try { ld = GameManager.m_level_data; } catch (Exception) { }
+                if (ld == null || ld.Segments == null || ld.SegmentVerts == null)
+                    return false;
+                if (fromSeg < 0 || fromSeg >= ld.Segments.Length ||
+                    toSeg < 0 || toSeg >= ld.Segments.Length)
+                    return false;
+                int[] fromPorts = ld.Segments[fromSeg].Portals;
+                int[] toPorts = ld.Segments[toSeg].Portals;
+                int[] verts = ld.Segments[fromSeg].VertIndices;
+                if (fromPorts == null || toPorts == null || verts == null)
+                    return false;
+                int n = fromPorts.Length < 6 ? fromPorts.Length : 6;
+                int m = toPorts.Length < 6 ? toPorts.Length : 6;
+                for (int i = 0; i < n; i++)
+                {
+                    if (fromPorts[i] < 0)
+                        continue;
+                    for (int j = 0; j < m; j++)
+                    {
+                        if (toPorts[j] < 0)
+                            continue;
+                        if (fromPorts[i] == toPorts[j])
+                        {
+                            Vector3[] q = new Vector3[4];
+                            for (int k = 0; k < 4; k++)
+                            {
+                                int vi = verts[SegmentData.SideVertexOrder[i][k]];
+                                q[k] = ld.SegmentVerts[vi];
+                            }
+                            // Newell normal over the quad.
+                            Vector3 nn = Vector3.zero;
+                            for (int k = 0; k < 4; k++)
+                            {
+                                Vector3 a = q[k];
+                                Vector3 b = q[(k + 1) % 4];
+                                nn.x += (a.y - b.y) * (a.z + b.z);
+                                nn.y += (a.z - b.z) * (a.x + b.x);
+                                nn.z += (a.x - b.x) * (a.y + b.y);
+                            }
+                            if (nn.sqrMagnitude < 1e-12f)
+                                return false;
+                            nn.Normalize();
+                            // Orient toward the next segment.
+                            Vector3 toCentre;
+                            if (!TryGetSegmentCentre(toSeg, out toCentre))
+                                return false;
+                            Vector3 pc = (q[0] + q[1] + q[2] + q[3]) * 0.25f;
+                            if (Vector3.Dot(nn, toCentre - pc) < 0f)
+                                nn = -nn;
+                            normal = nn;
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[GuidebotSteering] GetPortalNormal failed: " + ex.ToString());
+                return false;
+            }
+        }
+
         // True when the bot is within kRidgeProximity of any waypoint
         // of the ridge entry (3D distance). The ridge waypoints ARE the
         // climb, so this is the location the z-band was standing in for.
@@ -1329,7 +1819,7 @@ namespace GameMod
             {
                 int k = forward ? i : (rg.Waypoints.Count - 1 - i);
                 Vector3 wp = rg.Waypoints[k];
-                if (IsPassed(wp, botPos, dir, forward))
+                if (IsPassed(wp, botPos, dir, forward, kWaypointReach))
                     continue;
                 dest = wp;
                 // Forward guard: never aim behind the bot along the
@@ -1385,12 +1875,17 @@ namespace GameMod
             }
             dir.Normalize();
 
-            // Next unpassed waypoint in travel order.
+            // Next unpassed waypoint in travel order. The crossing
+            // itself uses the tighter kCrossingReach (Fix B, Nov 23):
+            // at kWaypointReach the sequence ended 2.0 m early and
+            // handed back to the stock flip. (wp == dw.Crossing is an
+            // exact-value comparison: seq holds the crossing itself.)
             for (int i = 0; i < seq.Count; i++)
             {
                 int k = forward ? i : (seq.Count - 1 - i);
                 Vector3 wp = seq[k];
-                if (IsPassed(wp, botPos, dir, forward))
+                float reach = (wp == dw.Crossing) ? kCrossingReach : kWaypointReach;
+                if (IsPassed(wp, botPos, dir, forward, reach))
                     continue;
                 dest = wp;
                 kind = (wp == dw.Crossing) ? "doorway-crossing" : "doorway-approach";
@@ -1409,9 +1904,9 @@ namespace GameMod
             return false;
         }
 
-        static bool IsPassed(Vector3 wp, Vector3 botPos, Vector3 dir, bool forward)
+        static bool IsPassed(Vector3 wp, Vector3 botPos, Vector3 dir, bool forward, float reach)
         {
-            if (Vector3.Distance(botPos, wp) < kWaypointReach)
+            if (Vector3.Distance(botPos, wp) < reach)
                 return true;
             float along = Vector3.Dot(botPos - wp, dir);
             return forward ? (along > 0f) : (along < 0f);
@@ -1982,6 +2477,10 @@ namespace GameMod
                 // before the log line -- so the line records the
                 // overridden destination, not the stock flip.
                 Robot_DoPathfindMovement_GuidebotSteering.HoldPortalLine(__instance);
+                // Fix C (Nov 23): lift outdoor aims above the terrain
+                // (buried portal centres), before the log line -- so
+                // the line records the lifted destination.
+                Robot_DoPathfindMovement_GuidebotSteering.LiftDestinationForTerrain(__instance);
                 // Destination logging (Nov 22, e5a796ff flight): after
                 // the resync, so the line records the destination the
                 // stock follower set for the next frame with the
@@ -2022,6 +2521,27 @@ namespace GameMod
     // restores the saved values, so a fake can never leak past the
     // call; m_target_dist / target_visible are recomputed every
     // FixedUpdate anyway).
+    //
+    // Fix D (Nov 23) -- kept-path destination stomp. The TO_GOAL case
+    // (decompile L92935-ish) sets m_next_destination_position =
+    // Segments[Global_path[0]].Center after ANY successful
+    // CreatePathToSegment -- including our kept-path skip, where the
+    // prefix returns __result = true without rebuilding the path, so
+    // InitPath never re-runs and the destination is never re-derived:
+    // the accumulated destination (portal aim, doorway hold, terrain
+    // lift) is stomped to the route-origin centre every 3 s
+    // (sub_move_timer). The prefix therefore saves the destination on
+    // entry (and resets the shared kept-path marker, so a true
+    // observed in the postfix was set during THIS call), and the
+    // postfix restores it when the path was kept and the dest was
+    // stomped to the origin centre. Unlike the hold inputs, this runs
+    // regardless of kHoldGuidebotToGoal_TestFlight: it is a permanent
+    // fix, not a test setting. The movement prefix's
+    // RepairStaleDestination already repairs the stomp on most frames
+    // (pos > 0, now pos 0 too); this preserves the accumulated state
+    // across the call for the frames where the follower does not
+    // re-derive it (off-route, ridge climb). Fail-open: any exception
+    // leaves the stomped destination in place (the repair still runs).
     // GuideBot only.
     [HarmonyPatch(typeof(Robot), "GuideBotLeadPlayer")]
     public class Robot_GuideBotLeadPlayer_GuidebotSteering
@@ -2038,13 +2558,25 @@ namespace GameMod
         private static bool s_holdActive;
         private static int s_lastHoldGoal = -1;
 
+        // Fix D save slots: the destination on entry, and whether it
+        // is valid (set by the prefix, consumed by the postfix).
+        private static Vector3 s_savedDestination;
+        private static bool s_savedDestValid;
+
         static bool Prefix(Robot __instance, int goal_seg)
         {
-            if (!kHoldGuidebotToGoal_TestFlight || __instance == null ||
-                !__instance.m_is_guide_bot)
+            if (__instance == null || !__instance.m_is_guide_bot)
                 return true;
             try
             {
+                // Fix D: save the destination and reset the kept-path
+                // marker BEFORE the original runs (see above). This
+                // runs regardless of the test-flight hold flag.
+                s_savedDestination = __instance.m_next_destination_position;
+                s_savedDestValid = true;
+                Robot_CreatePathToSegment_GuidebotSteering.s_createPathSkipped = false;
+                if (!kHoldGuidebotToGoal_TestFlight)
+                    return true;
                 s_savedTargetDist = __instance.m_target_dist;
                 s_savedTargetVisible = __instance.target_visible;
                 s_holdActive = true;
@@ -2063,6 +2595,7 @@ namespace GameMod
             catch (System.Exception ex)
             {
                 s_holdActive = false;
+                s_savedDestValid = false;
                 Debug.Log("[GuidebotSteering] GuideBotLeadPlayer hold prefix failed: " + ex.ToString());
                 return true;
             }
@@ -2070,19 +2603,56 @@ namespace GameMod
 
         static void Postfix(Robot __instance)
         {
-            if (!s_holdActive)
+            // Restore the hold inputs first (existing behaviour).
+            if (s_holdActive)
+            {
+                s_holdActive = false;
+                try
+                {
+                    if (__instance != null)
+                    {
+                        __instance.m_target_dist = s_savedTargetDist;
+                        __instance.target_visible = s_savedTargetVisible;
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    Debug.Log("[GuidebotSteering] GuideBotLeadPlayer hold postfix failed: " + ex.ToString());
+                }
+            }
+            // Fix D: undo the kept-path destination stomp (see above).
+            if (!s_savedDestValid)
                 return;
-            s_holdActive = false;
+            s_savedDestValid = false;
             try
             {
                 if (__instance == null)
                     return;
-                __instance.m_target_dist = s_savedTargetDist;
-                __instance.target_visible = s_savedTargetVisible;
+                if (!Robot_CreatePathToSegment_GuidebotSteering.s_createPathSkipped)
+                    return; // original ran (new path): the reset is legitimate
+                if (__instance.Global_path == null || __instance.Global_path_length <= 0)
+                    return;
+                LevelData ld = null;
+                try { ld = GameManager.m_level_data; } catch (System.Exception) { }
+                if (ld == null || ld.Segments == null)
+                    return;
+                int origin = __instance.Global_path[0];
+                if (origin < 0 || origin >= ld.Segments.Length)
+                    return;
+                Vector3 originCentre = ld.Segments[origin].Center;
+                Vector3 now = __instance.m_next_destination_position;
+                if ((now - originCentre).sqrMagnitude > 0.25f)
+                    return; // not stomped: the original left another destination
+                if ((s_savedDestination - originCentre).sqrMagnitude <= 0.25f)
+                    return; // saved dest WAS the origin centre: nothing to restore
+                __instance.m_next_destination_position = s_savedDestination;
+                Debug.Log("[GuidebotSteering] kept-path dest stomp undone: restored " +
+                    s_savedDestination.ToString() + " (GuideBotLeadPlayer had reset it to route-origin seg " +
+                    origin + " centre)");
             }
             catch (System.Exception ex)
             {
-                Debug.Log("[GuidebotSteering] GuideBotLeadPlayer hold postfix failed: " + ex.ToString());
+                Debug.Log("[GuidebotSteering] GuideBotLeadPlayer dest-restore postfix failed: " + ex.ToString());
             }
         }
     }
