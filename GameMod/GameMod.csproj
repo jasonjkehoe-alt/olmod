@@ -140,6 +140,7 @@
     <Compile Include="HatchHandlePress.cs" />
     <Compile Include="CircularDoor.cs" />
     <Compile Include="SkyProbe.cs" />
+    <Compile Include="SkyFarClip.cs" />
     <Compile Include="SwatterHp.cs" />
     <Compile Include="TextureMotionManager.cs" />
     <Compile Include="RelentlessGoblin.cs" />
