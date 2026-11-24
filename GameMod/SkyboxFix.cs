@@ -1,5 +1,23 @@
 // SkyboxFix.cs -- runtime fix for the gray sky mask (L1/L2).
 //
+// MAGENTA DIAGNOSTIC (Nov 24, Q5 test from the high-end model review):
+// this build replaces the sphere's nebula texture with FLAT BRIGHT
+// MAGENTA emission and logs one probe line per level load (plus every
+// 5 s while outdoors). It distinguishes the three outcomes:
+//   solid vivid magenta in the gray region = the gray is the -18 deg
+//     gap behind the dome (fix the sphere UVs or extend the dome);
+//   dull/desaturated magenta = something draws ON TOP of the sky in
+//     camera/screen space (post-process or overlay -- stop editing sky
+//     meshes);
+//   zero magenta = the sphere is culled (winding / Cull Back / bounds)
+//     or an opaque mesh sits in front of it.
+// The sphere UVs are DELIBERATELY NOT fixed in this build (the model
+// proved the equirectangular mapping is wrong for the radial disc
+// texture -- the black centre lands on the horizon -- but the magenta
+// test comes first; the UV fix is the NEXT job). RecalculateBounds IS
+// present in BuildSkySphereMesh (the model's claim it might be missing
+// was wrong -- it is called right after mesh.triangles = tris).
+//
 // Phase 1 (overnight job, Nov 24) decided H2: the gray over the sky is
 // a separate mask/overlay, NOT the dome's own "crazy sci-fi" texture.
 // The texture is exonerated (video ball avg (115,77,27) == texture avg
@@ -124,6 +142,8 @@ namespace GameMod
     public class SkyboxFixFollower : MonoBehaviour
     {
         private Camera m_cam = null;
+        // Magenta diagnostic: log the sphere probe line every 5 s.
+        private float m_lastProbeLog = -100f;
 
         void LateUpdate()
         {
@@ -133,6 +153,11 @@ namespace GameMod
                     m_cam = Camera.main;
                 if (m_cam != null)
                     transform.position = m_cam.transform.position;
+                if (Time.time - m_lastProbeLog >= 5f)
+                {
+                    m_lastProbeLog = Time.time;
+                    SkyboxFixPatch.LogSphereProbe();
+                }
             }
             catch (Exception)
             {
@@ -329,6 +354,87 @@ namespace GameMod
             }
         }
 
+        // Magenta diagnostic probe line: vis (is the sphere renderer
+        // visible in any camera?), bounds (the sphere mesh bounds --
+        // zero-size would mean RecalculateBounds never ran), cams (how
+        // many cameras exist), pp (the PostProcessingBehaviour profile
+        // name on Camera.main, or "none"). Logged once per level load
+        // (from BuildSkySphereMesh) and every 5 s by the follower.
+        // The PostProcessing lookup is reflection-based on purpose:
+        // it must NOT create a compile-time dependency on the
+        // PostProcessing assembly (which may not be referenced).
+        public static void LogSphereProbe()
+        {
+            try
+            {
+                string vis = "no-sphere";
+                string bounds = "no-sphere";
+                if (s_sphere != null)
+                {
+                    MeshRenderer mr = s_sphere.GetComponent<MeshRenderer>();
+                    MeshFilter mf = s_sphere.GetComponent<MeshFilter>();
+                    if (mr != null)
+                        vis = mr.isVisible ? "true" : "false";
+                    if (mf != null && mf.sharedMesh != null)
+                        bounds = mf.sharedMesh.bounds.ToString();
+                }
+                int cams = Camera.allCamerasCount;
+                string pp = GetPostProcessingProfileName(Camera.main);
+                Debug.Log("[SKY PROBE] vis=" + vis + " bounds=" + bounds
+                    + " cams=" + cams + " pp=" + pp);
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[SKY PROBE] probe failed: " + ex.Message);
+            }
+        }
+
+        private static string GetPostProcessingProfileName(Camera cam)
+        {
+            if (cam == null)
+                return "none";
+            try
+            {
+                Component[] comps = cam.GetComponents<Component>();
+                foreach (Component c in comps)
+                {
+                    if (c == null)
+                        continue;
+                    string tname = c.GetType().FullName;
+                    if (tname == null
+                        || tname.IndexOf("PostProcessing", StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+                    // Found a post-processing component. Read its
+                    // profile.name by reflection (null-safe).
+                    try
+                    {
+                        var profileProp = c.GetType().GetProperty("profile");
+                        if (profileProp == null)
+                            return c.GetType().Name;
+                        object profile = profileProp.GetValue(c, null);
+                        if (profile == null)
+                            return "none (profile null)";
+                        var nameProp = profile.GetType().GetProperty("name");
+                        if (nameProp != null)
+                        {
+                            object n = nameProp.GetValue(profile, null);
+                            if (n != null)
+                                return n.ToString();
+                        }
+                        return profile.ToString();
+                    }
+                    catch (Exception)
+                    {
+                        return c.GetType().Name;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            return "none";
+        }
+
         // Build the sky sphere mesh: a sphere of radius kSphereRadius
         // with spherical UV mapping (u = longitude 0-1, v = latitude
         // 0-1 pole to pole), triangles wound inward, using the ORIGINAL
@@ -402,12 +508,21 @@ namespace GameMod
                 Debug.Log(kTag + " Standard shader not found -- sky sphere NOT built (fail open)");
                 return;
             }
+            // MAGENTA DIAGNOSTIC (Q5 test): flat bright magenta emission,
+            // NO texture. Standard is kept deliberately (same shader path
+            // as round 3, so the ZWrite/Cull behaviour under test is
+            // unchanged). _Color is black so the albedo contributes
+            // nothing under scene lighting -- without it, white albedo +
+            // magenta emission would render pinkish-white, not flat
+            // magenta, and the vivid-vs-dull distinction the test relies
+            // on would be unreadable. The equirectangular UVs are
+            // irrelevant for a flat colour and are NOT changed here.
             Material mat = new Material(standard);
-            mat.name = "SkyboxFix_Sphere_" + skyTex.name;
-            // ORIGINAL texture object directly -- same as the dome.
-            mat.mainTexture = skyTex;
-            mat.SetTexture("_EmissionMap", skyTex);
-            mat.SetColor("_EmissionColor", Color.white);
+            mat.name = "SkyboxFix_Sphere_MAGENTA";
+            mat.mainTexture = null;
+            mat.SetTexture("_EmissionMap", null);
+            mat.SetColor("_Color", Color.black);
+            mat.SetColor("_EmissionColor", Color.magenta);
             mat.EnableKeyword("_EMISSION");
             mat.SetFloat("_Metallic", 0f);
             mat.SetFloat("_Glossiness", 0f);
@@ -438,11 +553,15 @@ namespace GameMod
             s_sphere = go;
 
             Debug.Log(kTag + " sky sphere mesh built: SkyboxFix_Sphere"
+                + " (MAGENTA DIAGNOSTIC)"
                 + " radius=" + r + " lon=" + lon + " lat=" + lat
                 + " verts=" + totalVerts + " tris=" + totalTris
-                + " tex=" + skyTex.name
+                + " tex=none (magenta emission)"
                 + " renderQueue=1000 layer=14"
                 + " pos=" + go.transform.position.ToString());
+
+            // Magenta diagnostic probe line (once per level load).
+            LogSphereProbe();
         }
 
         // Occlusion culling off on the main camera (rules out an
