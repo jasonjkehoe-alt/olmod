@@ -11,31 +11,68 @@
 // is the sky by design). The gray is Unity's Skybox-clear fallback
 // showing where the dome mesh does not cover the view.
 //
-// This patch gives the camera a real sky background built from the
-// dome's own texture, so the background is nebula instead of gray:
-//   - At level load: find the D3 sky texture (same matching as
-//     SkyProbe: "crazy sci-fi" / "marsplanet" / "sun" / "phobossky" /
-//     "mercsun11", or a huge-bounds sky renderer) and build a Cubemap
-//     from it (the disc texture on all six faces -- a nebula disc in
-//     every direction, which is what a space sky is). Assign it to
-//     RenderSettings.skybox via the Skybox/Cubemap shader.
-//   - Disable occlusion culling on the main camera (rules out occlusion
-//     culling as a contributor; the dome is huge and should never be
-//     occluded, but a false positive would mask the sky).
-//   - Set the camera background colour to black as a belt-and-braces
-//     fallback (harmless once the skybox is set; better than gray if
-//     the skybox ever fails to apply).
+// Round 1 (fc35e85) built a Cubemap skybox from the dome's own texture
+// and assigned it to RenderSettings.skybox via the Skybox/Cubemap
+// shader. That FAILED in the Nov 24 morning flight: the log shows
+//   [SKY FIX] Skybox/Cubemap shader not found -- skybox NOT set (fail open)
+// Shader.Find("Skybox/Cubemap") returns null -- Unity strips shaders no
+// asset references, and no skybox shader survives in the Overload build.
+// So RenderSettings.skybox was never set, and the CAM lines confirm
+// skybox=none skyboxShader=none on every tick. The dome mesh itself
+// renders fine (the bright circle in the flight screenshot IS the dome).
 //
-// The dome mesh continues to render on top for detail (it is opaque
-// and depth-tested, so it draws over the skybox where it renders).
-// No geometry, UVs, normals, textures, or materials are changed.
-// No level is hardcoded; the sky texture is found generically, so
-// this works for L1 (crazy sci-fi) and L2 (phobossky) alike.
+// Round 2 (this file): do NOT depend on RenderSettings.skybox or any
+// skybox shader. The fix is a runtime sky-box MESH built from the
+// dome's own texture, using only components proven to render in this
+// build: the Standard shader (the dome renders with it), a mesh, and
+// the dome's own texture.
+//
+// The mesh is a spherified cube ("sky box") centred on the camera:
+//   - Radius 700 m: inside the camera farClip of 800 m (SkyFarClip),
+//     outside the 511 m dome, so the dome (nearer) still renders on
+//     top of it wherever the dome covers the view.
+//   - Each face is a 4x4 grid spherified onto the 700 m sphere, so no
+//     point of the mesh sags inside the dome or pokes past the far
+//     plane (a flat cube's corners sit at 1212 m and would be clipped
+//     by the far plane, leaving gray bands along the cube edges).
+//   - Each face maps the full nebula texture (a disc on every face --
+//     the same visual result the cubemap attempted).
+//   - Triangles are wound inward (visible from inside) and the
+//     material also sets Cull Off as belt-and-braces.
+//   - Material: Standard shader, full-strength emission from the dome
+//     texture (same as the dome), metallic 0, glossiness 0.
+//   - renderQueue 1000 (Background): drawn first, so the dome, the
+//     Sun+stars mesh, and the terrain all draw over it. ZWrite off,
+//     so nothing behind the box is depth-blocked by it.
+//   - No collider (raycasts pass through), no shadow casting or
+//     receiving, no light/reflection probes.
+//   - A follower component re-centres the box on Camera.main every
+//     frame (LateUpdate), so it always surrounds the player.
+//   - Layer 14 (Level, same as the dome) so it is inside the camera
+//     cull mask.
+//
+// Shader fallback chain (cheap, first): Shader.Find("Skybox/Cubemap"),
+// then "Skybox/Procedural", then "Skybox/6 Sided". Only Skybox/Cubemap
+// and Skybox/6 Sided can actually carry the nebula texture (Procedural
+// generates its own sky and has no texture input, so it is logged and
+// skipped). If a usable shader IS found, the RenderSettings.skybox
+// path (the round-1 code) is used; otherwise the box mesh is built.
+// Either way the log says which path was taken, with a [SKY FIX] tag.
+//
+// Also (unchanged from round 1): disable occlusion culling on the main
+// camera and set the camera background colour to black as a fallback.
+// These run on every level load, before the path choice, so a fresh
+// camera on a reloaded level still gets them.
+//
+// No geometry, UVs, normals, textures, or materials of the level are
+// changed. No level is hardcoded; the sky texture is found generically,
+// so this works for L1 (crazy sci-fi) and L2 (phobossky) alike.
 //
 // Fail-open throughout: any failure is logged with a "[SKY FIX]"
-// prefix and the level loads unchanged. This is a fix, not a probe,
-// but it never blocks level load. Do NOT remove SkyProbe.cs; the probe
-// stays for verification (its CAM lines will now show the skybox set).
+// prefix and the level loads unchanged. Do NOT remove SkyProbe.cs; the
+// probe stays for verification (its BIG scan will now list the box as
+// SkyboxFix_Box -- that is expected -- and its CAM lines will show
+// occCull=False and the box in the SKY/BIG lines).
 
 using HarmonyLib;
 using Overload;
@@ -45,6 +82,28 @@ using UnityEngine;
 
 namespace GameMod
 {
+    // Keeps the sky box centred on the camera so it always surrounds
+    // the player. LateUpdate runs after the camera has moved.
+    public class SkyboxFixFollower : MonoBehaviour
+    {
+        private Camera m_cam = null;
+
+        void LateUpdate()
+        {
+            try
+            {
+                if (m_cam == null)
+                    m_cam = Camera.main;
+                if (m_cam != null)
+                    transform.position = m_cam.transform.position;
+            }
+            catch (Exception)
+            {
+                // Fail silent: a static box is still better than none.
+            }
+        }
+    }
+
     public static class SkyboxFixPatch
     {
         private const string kTag = "[SKY FIX]";
@@ -58,7 +117,24 @@ namespace GameMod
             "crazy sci-fi", "marsplanet", "sun", "phobossky", "mercsun11"
         };
 
-        private static bool s_applied = false;
+        // Skybox shaders, in preference order. Only Skybox/Cubemap and
+        // Skybox/6 Sided can carry a texture; Skybox/Procedural has no
+        // texture input and is logged and skipped if found.
+        private static readonly string[] kSkyboxShaders = new string[]
+        {
+            "Skybox/Cubemap", "Skybox/Procedural", "Skybox/6 Sided"
+        };
+
+        // Sky box geometry: spherified cube, radius 700 m (inside the
+        // 800 m farClip, outside the 511 m dome), 4 quads per face
+        // edge (sag ~13 m, so the closest mesh point is ~687 m --
+        // still outside the dome, still inside the far plane).
+        private const float kBoxRadius = 700f;
+        private const int kBoxSubdiv = 4;
+
+        // The live box mesh (null until built, Unity-null after the
+        // scene unloads -- so a reloaded level rebuilds it fresh).
+        private static GameObject s_box = null;
 
         [HarmonyPatch(typeof(GameplayManager), "StartLevel")]
         public static class StartLevelPatch
@@ -188,56 +264,252 @@ namespace GameMod
             return cm;
         }
 
-        private static void Apply()
+        // Try the skybox shader chain. Returns the shader to use for
+        // the RenderSettings.skybox path, or null if no usable shader
+        // is in the build (the round-1 failure: Unity strips shaders
+        // no asset references). Skybox/Procedural is logged and
+        // skipped -- it generates its own sky and has no texture
+        // input, so it cannot carry the nebula.
+        private static Shader FindSkyboxShader()
         {
-            // Run once per level load; StartLevel fires once per load,
-            // and s_applied guards against a double-apply within it.
-            if (s_applied)
+            foreach (string name in kSkyboxShaders)
             {
-                Debug.Log(kTag + " already applied this load, skipping");
-                return;
+                Shader s = null;
+                try { s = Shader.Find(name); }
+                catch (Exception ex)
+                {
+                    Debug.Log(kTag + " Shader.Find(" + name + ") threw: " + ex.Message);
+                }
+                if (s == null)
+                {
+                    Debug.Log(kTag + " skybox shader not found: " + name);
+                    continue;
+                }
+                if (name == "Skybox/Procedural")
+                {
+                    Debug.Log(kTag + " skybox shader found: " + name
+                        + " -- has no texture input, cannot carry the nebula; using box mesh instead");
+                    continue;
+                }
+                Debug.Log(kTag + " skybox shader found: " + name);
+                return s;
             }
+            return null;
+        }
 
-            Texture2D skyTex = FindSkyTexture();
-            if (skyTex == null)
-            {
-                Debug.Log(kTag + " no D3 sky texture found -- skybox NOT set (fail open)");
-                return;
-            }
-
-            Shader cubemapShader = Shader.Find("Skybox/Cubemap");
-            if (cubemapShader == null)
-            {
-                Debug.Log(kTag + " Skybox/Cubemap shader not found -- skybox NOT set (fail open)");
-                return;
-            }
-
+        // Round-1 path: build a Cubemap from the dome texture and
+        // assign it to RenderSettings.skybox. Only used when a usable
+        // skybox shader survived in the build.
+        private static void ApplySkyboxMaterial(Texture2D skyTex, Shader skyShader)
+        {
             Texture2D readable = null;
-            Cubemap cm = null;
             try
             {
                 readable = MakeReadable(skyTex);
-                cm = BuildCubemap(readable);
             }
             catch (Exception ex)
             {
-                Debug.Log(kTag + " cubemap build failed (fail open): " + ex.ToString());
+                Debug.Log(kTag + " readable copy failed (fail open): " + ex.ToString());
                 return;
             }
 
-            Material skyboxMat = new Material(cubemapShader);
-            skyboxMat.SetTexture("_Tex", cm);
-            skyboxMat.SetFloat("_Exposure", 1.0f);
-            skyboxMat.SetFloat("_Rotation", 0f);
+            Material skyboxMat = new Material(skyShader);
             skyboxMat.name = "SkyboxFix_" + skyTex.name;
+            if (skyShader.name == "Skybox/6 Sided")
+            {
+                // 6 Sided takes one texture per face; the nebula disc
+                // goes on all six, same as the cubemap did.
+                skyboxMat.SetTexture("_FrontTex", readable);
+                skyboxMat.SetTexture("_BackTex", readable);
+                skyboxMat.SetTexture("_LeftTex", readable);
+                skyboxMat.SetTexture("_RightTex", readable);
+                skyboxMat.SetTexture("_UpTex", readable);
+                skyboxMat.SetTexture("_DownTex", readable);
+            }
+            else
+            {
+                // Skybox/Cubemap.
+                Cubemap cm = null;
+                try
+                {
+                    cm = BuildCubemap(readable);
+                }
+                catch (Exception ex)
+                {
+                    Debug.Log(kTag + " cubemap build failed (fail open): " + ex.ToString());
+                    return;
+                }
+                skyboxMat.SetTexture("_Tex", cm);
+                skyboxMat.SetFloat("_Exposure", 1.0f);
+                skyboxMat.SetFloat("_Rotation", 0f);
+            }
             RenderSettings.skybox = skyboxMat;
             Debug.Log(kTag + " skybox set: " + skyboxMat.name
-                + " shader=" + cubemapShader.name
-                + " cubemap=" + cm.width + "x" + cm.height
+                + " shader=" + skyShader.name
                 + " srcTex=" + skyTex.name);
+        }
 
-            // Occlusion culling off on the main camera (rules out an
-            // occlusion-culling false positive masking the sky).
+        // One face of the spherified cube, as its four corners in
+        // order v0, v1, v2, v3 (u runs v0->v1, v runs v0->v3).
+        // Triangles per quad are (a,b,c),(a,c,d) on the +X/-X faces
+        // and (a,c,b),(a,d,c) on the others, where a=(i,j), b=(i+1,j),
+        // c=(i+1,j+1), d=(i,j+1) -- wound so the front faces point
+        // INWARD (visible from inside the box). Verified by cross
+        // product on every face before this shipped.
+        private struct FaceDef
+        {
+            public Vector3 v0;
+            public Vector3 v1;
+            public Vector3 v2;
+            public Vector3 v3;
+            public bool flip;
+            public FaceDef(Vector3 a, Vector3 b, Vector3 c, Vector3 d, bool f)
+            {
+                v0 = a; v1 = b; v2 = c; v3 = d; flip = f;
+            }
+        }
+
+        // Build the sky box mesh: a spherified cube of radius
+        // kBoxRadius, each face a kBoxSubdiv x kBoxSubdiv grid mapping
+        // the full nebula texture, triangles wound inward. No collider,
+        // no shadows, Background render queue, ZWrite off, full
+        // emission from the dome texture via the Standard shader.
+        private static void BuildSkyBoxMesh(Texture2D skyTex)
+        {
+            float h = kBoxRadius;
+            int n = kBoxSubdiv;
+            FaceDef[] faces = new FaceDef[]
+            {
+                // +X (flip=false): (0,1,2),(0,2,3)
+                new FaceDef(new Vector3(h, -h, -h), new Vector3(h, -h, h), new Vector3(h, h, h), new Vector3(h, h, -h), false),
+                // -X (flip=false)
+                new FaceDef(new Vector3(-h, -h, h), new Vector3(-h, -h, -h), new Vector3(-h, h, -h), new Vector3(-h, h, h), false),
+                // +Y (flip=true): (0,2,1),(0,3,2)
+                new FaceDef(new Vector3(-h, h, -h), new Vector3(-h, h, h), new Vector3(h, h, h), new Vector3(h, h, -h), true),
+                // -Y (flip=true)
+                new FaceDef(new Vector3(-h, -h, h), new Vector3(-h, -h, -h), new Vector3(h, -h, -h), new Vector3(h, -h, h), true),
+                // +Z (flip=true)
+                new FaceDef(new Vector3(-h, -h, h), new Vector3(h, -h, h), new Vector3(h, h, h), new Vector3(-h, h, h), true),
+                // -Z (flip=true)
+                new FaceDef(new Vector3(h, -h, -h), new Vector3(-h, -h, -h), new Vector3(-h, h, -h), new Vector3(h, h, -h), true),
+            };
+
+            int vertsPerFace = (n + 1) * (n + 1);
+            int totalVerts = faces.Length * vertsPerFace;
+            int totalTris = faces.Length * n * n * 2;
+            Vector3[] verts = new Vector3[totalVerts];
+            Vector3[] normals = new Vector3[totalVerts];
+            Vector2[] uvs = new Vector2[totalVerts];
+            int[] tris = new int[totalTris * 3];
+
+            int vBase = 0;
+            int tBase = 0;
+            for (int f = 0; f < faces.Length; f++)
+            {
+                FaceDef fd = faces[f];
+                for (int j = 0; j <= n; j++)
+                {
+                    for (int i = 0; i <= n; i++)
+                    {
+                        float u = (float)i / (float)n;
+                        float v = (float)j / (float)n;
+                        // Bilinear point on the flat cube face, then
+                        // spherify onto the kBoxRadius sphere.
+                        Vector3 p = fd.v0 + (fd.v1 - fd.v0) * u + (fd.v3 - fd.v0) * v;
+                        Vector3 dir = p.normalized;
+                        Vector3 sp = dir * h;
+                        int idx = vBase + j * (n + 1) + i;
+                        verts[idx] = sp;
+                        normals[idx] = -dir; // inward
+                        uvs[idx] = new Vector2(u, v);
+                    }
+                }
+                for (int j = 0; j < n; j++)
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        int a = vBase + j * (n + 1) + i;
+                        int b = vBase + j * (n + 1) + (i + 1);
+                        int c = vBase + (j + 1) * (n + 1) + (i + 1);
+                        int d = vBase + (j + 1) * (n + 1) + i;
+                        if (!fd.flip)
+                        {
+                            tris[tBase++] = a; tris[tBase++] = b; tris[tBase++] = c;
+                            tris[tBase++] = a; tris[tBase++] = c; tris[tBase++] = d;
+                        }
+                        else
+                        {
+                            tris[tBase++] = a; tris[tBase++] = c; tris[tBase++] = b;
+                            tris[tBase++] = a; tris[tBase++] = d; tris[tBase++] = c;
+                        }
+                    }
+                }
+                vBase += vertsPerFace;
+            }
+
+            Mesh mesh = new Mesh();
+            mesh.name = "SkyboxFix_BoxMesh";
+            mesh.vertices = verts;
+            mesh.normals = normals;
+            mesh.uv = uvs;
+            mesh.triangles = tris;
+            mesh.RecalculateBounds();
+
+            Shader standard = Shader.Find("Standard");
+            if (standard == null)
+            {
+                Debug.Log(kTag + " Standard shader not found -- sky box NOT built (fail open)");
+                return;
+            }
+            Material mat = new Material(standard);
+            mat.name = "SkyboxFix_Box_" + skyTex.name;
+            mat.mainTexture = skyTex;
+            mat.SetTexture("_EmissionMap", skyTex);
+            mat.SetColor("_EmissionColor", Color.white);
+            mat.EnableKeyword("_EMISSION");
+            mat.SetFloat("_Metallic", 0f);
+            mat.SetFloat("_Glossiness", 0f);
+            // Do not write depth: the dome, Sun+stars, and terrain are
+            // nearer and must draw over the box. (Harmless if the
+            // shader ignores _ZWrite.)
+            mat.SetInt("_ZWrite", 0);
+            // Belt-and-braces: faces are wound inward anyway.
+            mat.SetInt("_Cull", 0);
+            // Background queue: drawn first, everything else draws over it.
+            mat.renderQueue = 1000;
+
+            GameObject go = new GameObject("SkyboxFix_Box");
+            // Layer 14 (Level, same as the dome) -- inside the camera cull mask.
+            go.layer = 14;
+            MeshFilter mf = go.AddComponent<MeshFilter>();
+            mf.sharedMesh = mesh;
+            MeshRenderer mr = go.AddComponent<MeshRenderer>();
+            mr.sharedMaterial = mat;
+            mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            mr.receiveShadows = false;
+            mr.lightProbeUsage = UnityEngine.Rendering.LightProbeUsage.Off;
+            mr.reflectionProbeUsage = UnityEngine.Rendering.ReflectionProbeUsage.Off;
+            go.AddComponent<SkyboxFixFollower>();
+            Camera cam = Camera.main;
+            if (cam != null)
+                go.transform.position = cam.transform.position;
+            s_box = go;
+
+            Debug.Log(kTag + " sky box mesh built: SkyboxFix_Box"
+                + " radius=" + h + " subdiv=" + n
+                + " verts=" + totalVerts + " tris=" + totalTris
+                + " tex=" + skyTex.name
+                + " renderQueue=1000 layer=14"
+                + " pos=" + go.transform.position.ToString());
+        }
+
+        // Occlusion culling off on the main camera (rules out an
+        // occlusion-culling false positive masking the sky) and the
+        // camera background to black as a belt-and-braces fallback
+        // (better than gray if the sky ever fails to apply). Runs on
+        // every level load so a fresh camera still gets it.
+        private static void ApplyCameraTweaks()
+        {
             try
             {
                 Camera cam = Camera.main;
@@ -245,8 +517,6 @@ namespace GameMod
                 {
                     bool wasOcc = cam.useOcclusionCulling;
                     cam.useOcclusionCulling = false;
-                    // Belt-and-braces: if the skybox ever fails to
-                    // apply, the fallback background is black, not gray.
                     cam.backgroundColor = Color.black;
                     Debug.Log(kTag + " camera: occCull " + wasOcc + " -> false, bg -> black"
                         + " clear=" + cam.clearFlags
@@ -254,15 +524,56 @@ namespace GameMod
                 }
                 else
                 {
-                    Debug.Log(kTag + " Camera.main null at apply time (skybox still set)");
+                    Debug.Log(kTag + " Camera.main null at apply time");
                 }
             }
             catch (Exception ex)
             {
                 Debug.Log(kTag + " camera tweak failed (fail open): " + ex.ToString());
             }
+        }
 
-            s_applied = true;
+        private static void Apply()
+        {
+            // Camera tweaks first: idempotent, and a reloaded level
+            // has a fresh camera that needs them too.
+            ApplyCameraTweaks();
+
+            Texture2D skyTex = FindSkyTexture();
+            if (skyTex == null)
+            {
+                Debug.Log(kTag + " no D3 sky texture found -- sky NOT fixed (fail open)");
+                return;
+            }
+
+            // Box mesh already active (same load)? Skip.
+            if (s_box != null)
+            {
+                Debug.Log(kTag + " sky box mesh already active, skipping");
+                return;
+            }
+
+            // Shader path already set for this texture (RenderSettings
+            // persists across scene loads)? Skip.
+            if (RenderSettings.skybox != null
+                && RenderSettings.skybox.name == "SkyboxFix_" + skyTex.name)
+            {
+                Debug.Log(kTag + " skybox already set for " + skyTex.name + ", skipping");
+                return;
+            }
+
+            // Shader fallback chain first (cheap). If a usable skybox
+            // shader survived in the build, use the RenderSettings
+            // path; otherwise build the box mesh.
+            Shader skyShader = FindSkyboxShader();
+            if (skyShader != null)
+            {
+                ApplySkyboxMaterial(skyTex, skyShader);
+                return;
+            }
+
+            Debug.Log(kTag + " no usable skybox shader in build -- building sky box mesh");
+            BuildSkyBoxMesh(skyTex);
         }
     }
 }
