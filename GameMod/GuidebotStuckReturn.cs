@@ -108,14 +108,19 @@ namespace GameMod
         // recovery only counts wall-contact resets (stay > 50), and a
         // bot stalled in OPEN SPACE never trips it -- stay peaked at 23
         // in 150 s while the bot sat 13.4 m from the portal, 492
-        // stuck-watch lines, zero recoveries. The stuck-watch condition
-        // (|v| < 0.05, destination > 1.0 m away) already detects exactly
-        // this stall; this sensor turns it into a trigger.
-        private const float kFreeStallSpeed = 0.05f;      // |v| below this counts as still (same as the stuck-watch)
+        // stuck-watch lines, zero recoveries. The stillness test is NET
+        // DISPLACEMENT, not instantaneous speed (hardened Nov 24, model
+        // review): a bot that has moved under 0.5 m in 12 s averages
+        // under 0.042 m/s, which is a stall by any measure. There is
+        // deliberately NO per-frame |v| threshold -- the old |v| < 0.05
+        // hard reset meant a single physics tick at |v| = 0.052 (the
+        // actual stall log reads |v| = 0.05, right on the boundary)
+        // reset the whole 12 s window, so the sensor could silently
+        // never fire. Velocity is still read for the fire log line only.
         private const float kFreeStallDestDist = 1.0f;    // destination farther than this counts as unreached (same as the stuck-watch)
         private const float kFreeStallMove = 0.5f;        // the bot must not have moved this far from the window-open position
         private const float kFreeStallWindow = 12.0f;     // continuous still window before the sensor fires
-        private const float kForcefieldWaitRadius = 6.0f; // an active forcefield within this of the bot = a legitimate field wait, not a stall
+        private const float kForcefieldWaitRadius = 6.0f; // an active forcefield within this of the bot = a legitimate field wait, not a stall (measured to the field's closest point, not its pivot -- see ClosestFieldDistance)
         private static float s_freeStallSince = -1f;      // game time the current still window opened (-1 = none)
         private static Vector3 s_freeStallRefPos;         // bot position when the current still window opened
 
@@ -323,24 +328,27 @@ namespace GameMod
         }
 
         // Free-space stall sensor (Nov 23 flight). Returns true
-        // when the bot has been still (|v| < 0.05, the stuck-watch
-        // threshold) with a destination > 1.0 m away (the stuck-watch
+        // when the bot has a destination > 1.0 m away (the stuck-watch
         // threshold) and has not moved 0.5 m from its window-open
-        // position for a continuous 12 s. The stuck-watch condition in
-        // LogDestination (GuidebotSteering) detects exactly this stall,
-        // but nothing acted on it: the stock recovery counts consecutive
-        // stock stuck-resets, which fire only on wall contact (stay >
-        // 50), and a bot stalled in open space never trips them (stay
-        // peaked at 23 in 150 s). When this returns true the caller runs
-        // the EXISTING recovery (return / teleport-forward) -- this is a
-        // second trigger, not a second recovery. Self-consuming: a true
-        // return resets the window, so the recovery is attempted at most
-        // once per 12 s still episode; a declined recovery (player
-        // off-route) re-arms the same way. Normal slow flight cannot
-        // trip it: 12 s of near-zero speed with an unreached destination
-        // and under 0.5 m of movement is not flight, it is a stall.
-        // Fail-open: any read failure resets the window and returns
-        // false -- the stock wall-contact trigger is unaffected.
+        // position for a continuous 12 s. Stillness is NET DISPLACEMENT
+        // (hardened Nov 24, model review): under 0.5 m in 12 s is under
+        // 0.042 m/s average, which is a stall by any measure. There is
+        // deliberately NO per-frame |v| threshold -- a single physics
+        // tick at |v| = 0.052 used to reset the whole window. The
+        // stuck-watch condition in LogDestination (GuidebotSteering)
+        // detects exactly this stall, but nothing acted on it: the stock
+        // recovery counts consecutive stock stuck-resets, which fire only
+        // on wall contact (stay > 50), and a bot stalled in open space
+        // never trips them (stay peaked at 23 in 150 s). When this
+        // returns true the caller runs the EXISTING recovery (return /
+        // teleport-forward) -- this is a second trigger, not a second
+        // recovery. Self-consuming: a true return resets the window, so
+        // the recovery is attempted at most once per 12 s still episode;
+        // a declined recovery (player off-route) re-arms the same way.
+        // Normal slow flight cannot trip it: 12 s with an unreached
+        // destination and under 0.5 m of movement is not flight, it is
+        // a stall. Fail-open: any read failure resets the window and
+        // returns false -- the stock wall-contact trigger is unaffected.
         static bool CheckFreeSpaceStall(Robot bot, float gameTime)
         {
             try
@@ -364,8 +372,11 @@ namespace GameMod
                 }
                 Vector3 botPos = bot.transform.position;
                 Vector3 dest = bot.m_next_destination_position;
-                bool still = vel.sqrMagnitude < kFreeStallSpeed * kFreeStallSpeed &&
-                             Vector3.Distance(dest, botPos) > kFreeStallDestDist;
+                // No per-frame |v| test (see the constants comment): the
+                // window's stillness test is the 0.5 m net-displacement
+                // check below. Velocity is read above for the fire log
+                // line only.
+                bool still = Vector3.Distance(dest, botPos) > kFreeStallDestDist;
                 if (!still)
                 {
                     ResetFreeSpaceWindow();
@@ -428,11 +439,13 @@ namespace GameMod
         // Forcefield found is up (the same API the game itself uses in
         // DeactivateAllForcefields / UpdateSegmentsForForcefields); the
         // activeSelf check is a second, explicit guard in case a future
-        // Unity version returns inactive objects too. A bot pressing
-        // against an UP field sits within ~1-2 m of the field prop (it
-        // aims at the portal centre where the prop sits); 6 m is
-        // generous, and the Nov 23 stall sat 23+ m from the field, so
-        // the guard cannot confuse the two. Called only when the sensor
+        // Unity version returns inactive objects too. Distance is measured
+        // to the CLOSEST point on the field (see ClosestFieldDistance),
+        // not to the prop pivot (hardened Nov 24, model review): a D3
+        // portal can be 12 m x 28 m, so a bot pressing the field near one
+        // edge can be 8-14 m from transform.position while still touching
+        // the field. The Nov 23 stall sat 23+ m from the field, so the
+        // guard cannot confuse the two. Called only when the sensor
         // window completes (at most once per 12 s), never every frame,
         // so the scene-wide search costs nothing in steady flight.
         // Fail-open toward the recovery: a lookup failure returns false
@@ -451,7 +464,7 @@ namespace GameMod
                 {
                     if (ff == null || ff.gameObject == null || !ff.gameObject.activeSelf)
                         continue;
-                    if (Vector3.Distance(botPos, ff.transform.position) < kForcefieldWaitRadius)
+                    if (ClosestFieldDistance(ff, botPos) < kForcefieldWaitRadius)
                         return true;
                 }
                 return false;
@@ -461,6 +474,37 @@ namespace GameMod
                 Debug.Log("[GuidebotStuckReturn] forcefield check failed: " + ex.ToString());
                 return false;
             }
+        }
+
+        // Distance from the bot to the closest point of a forcefield prop.
+        // Collider.ClosestPoint is exact for the collider shape (a box/plane
+        // collider on the field prop). Renderer bounds (world-space AABB) is
+        // the fallback. The prop pivot is the last resort. Each step is
+        // wrapped so a missing component degrades gracefully instead of
+        // failing the guard -- a failed lookup must not let the sensor fire
+        // past an UP field, so the fallback chain prefers the closest
+        // available measure over giving up.
+        static float ClosestFieldDistance(Forcefield ff, Vector3 botPos)
+        {
+            try
+            {
+                Collider col = ff.GetComponent<Collider>();
+                if (col == null)
+                    col = ff.GetComponentInChildren<Collider>();
+                if (col != null)
+                    return Vector3.Distance(botPos, col.ClosestPoint(botPos));
+            }
+            catch (Exception) { /* fall through to bounds */ }
+            try
+            {
+                Renderer rend = ff.GetComponent<Renderer>();
+                if (rend == null)
+                    rend = ff.GetComponentInChildren<Renderer>();
+                if (rend != null)
+                    return Mathf.Sqrt(rend.bounds.SqrDistance(botPos));
+            }
+            catch (Exception) { /* fall through to pivot */ }
+            return Vector3.Distance(botPos, ff.transform.position);
         }
 
         // Teleport-forward: the bot is wedged and the player is AHEAD of it on
