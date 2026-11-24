@@ -477,13 +477,25 @@ namespace GameMod
         }
 
         // Distance from the bot to the closest point of a forcefield prop.
-        // Collider.ClosestPoint is exact for the collider shape (a box/plane
-        // collider on the field prop). Renderer bounds (world-space AABB) is
-        // the fallback. The prop pivot is the last resort. Each step is
-        // wrapped so a missing component degrades gracefully instead of
-        // failing the guard -- a failed lookup must not let the sensor fire
-        // past an UP field, so the fallback chain prefers the closest
-        // available measure over giving up.
+        // Collider.ClosestPoint is exact for the collider shape -- but Unity
+        // 2017 only supports it on Box/Sphere/Capsule colliders and convex
+        // MeshColliders. On a non-convex MeshCollider it logs a warning and
+        // returns botPos unchanged, which would read as distance 0.0 and
+        // suppress the sensor for every active field in the level. So it is
+        // used only where valid; bounds.SqrDistance (which works on every
+        // enabled collider, including non-convex MeshCollider) is the
+        // fallback for other shapes and for a disabled collider, whose
+        // bounds collapse to (0,0,0). Renderer bounds (world-space AABB)
+        // is the next fallback. The prop pivot is the last resort. Each
+        // step is wrapped so a missing component degrades gracefully
+        // instead of failing the guard -- a failed lookup must not let the
+        // sensor fire past an UP field, so the fallback chain prefers the
+        // closest available measure over giving up.
+        // NOTE (verified Nov 24): the stock forcefield prefab
+        // (entity_prop_force_field, and the alien variant) carries a
+        // BoxCollider, so ClosestPoint is valid on the real asset and the
+        // gotcha was latent, not live. The guard stays: the helper must be
+        // correct regardless of the asset.
         static float ClosestFieldDistance(Forcefield ff, Vector3 botPos)
         {
             try
@@ -491,8 +503,13 @@ namespace GameMod
                 Collider col = ff.GetComponent<Collider>();
                 if (col == null)
                     col = ff.GetComponentInChildren<Collider>();
-                if (col != null)
-                    return Vector3.Distance(botPos, col.ClosestPoint(botPos));
+                if (col != null && col.enabled)
+                {
+                    bool canUseClosestPoint = !(col is MeshCollider) || ((MeshCollider)col).convex;
+                    if (canUseClosestPoint)
+                        return Vector3.Distance(botPos, col.ClosestPoint(botPos));
+                    return Mathf.Sqrt(col.bounds.SqrDistance(botPos));
+                }
             }
             catch (Exception) { /* fall through to bounds */ }
             try
