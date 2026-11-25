@@ -629,12 +629,15 @@ namespace GameMod
             // Never blocks the mesh build.
             LogReadableCopyAvg(skyTex);
 
-            // Round 3: always build the sphere mesh. No shader is
-            // consulted. The mesh material uses the ORIGINAL texture
-            // object directly (same as the dome) -- never the
-            // readable copy.
-            Debug.Log(kTag + " building sky sphere mesh (forced mesh path, round 3)");
-            BuildSkySphereMesh(skyTex);
+            // Nov 25 (GlobalFog fix): the magenta diagnostic sphere
+            // is PARKED -- the sky circle is the GlobalFog image
+            // effect, not an occluder, so the sphere is dead weight
+            // (invisible, occluded by the dome, zero magenta in
+            // flight). Do NOT build it; the camera tweaks above and
+            // the stale-skybox clear still run. BuildSkySphereMesh /
+            // LogSphereProbe / SkyboxFixFollower remain in the file
+            // unused so the diagnostic can be re-enabled if needed.
+            Debug.Log(kTag + " sky sphere NOT built (magenta diagnostic parked -- GlobalFog fix)");
         }
     }
 }

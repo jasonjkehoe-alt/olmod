@@ -100,6 +100,15 @@
       <HintPath>$(OverloadDir)\Overload_Data\Managed\UnityEngine.UnityWebRequestWWWModule.dll</HintPath>
     </Reference>
   </ItemGroup>
+  <!-- Build-only: lets the project compile with the .NET SDK on a machine
+       without the .NET Framework 3.5 targeting pack installed (without it
+       `dotnet build` fails with MSB3644). The package provides
+       compile-time reference assemblies only; it does not change the
+       compiled DLL's target framework or runtime behaviour. (Added Nov 25,
+       GlobalFog fix.) -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net35" Version="1.0.3" />
+  </ItemGroup>
   <ItemGroup>
     <Compile Include="AddOnLevelSort.cs" />
     <Compile Include="AmbientUnload.cs" />

@@ -30,6 +30,24 @@
 // Fail-open throughout: any failure is logged and the level loads
 // unchanged. No gameplay behaviour is changed -- a wider far plane
 // only ever shows more, never less.
+//
+// Nov 25 -- the sky circle is UnityStandardAssets.ImageEffects.GlobalFog,
+// an image effect permanently enabled on the Main Camera (serialized
+// m_Enabled=1 in the player ship prefab; lives in
+// Assembly-CSharp-firstpass.dll, NOT Assembly-CSharp.dll -- 0 references
+// in the Assembly-CSharp decompile, which is why it was missed). It
+// ignores RenderSettings.fog (off) and blits Hidden/GlobalFog Pass 1
+// every frame. That shader has a hardcoded fogFactor < 0.05 cutoff that
+// snaps to zero fog at 346.2 m planar view-space depth (density 0.0050):
+// the 511 m dome is clear straight ahead and gray-fogged off-axis -- the
+// view-centred circle. Terrain (20-60 m) never reaches the cliff, and
+// the post-processing toggle never touches GlobalFog (PP on/off changed
+// nothing). The big-model simulation fed the real L1 dome mesh through
+// the disassembled shader and reproduced the flight video
+// shape-for-shape. Fix (Option B, this file): disable the GlobalFog
+// Behaviour on the Main Camera when a D3 sky is present (string lookup,
+// no new assembly reference). D3 room fog (orange/pink fog-carrier
+// entities in the level) is a separate mechanism and is unaffected.
 
 using HarmonyLib;
 using Overload;
@@ -55,6 +73,47 @@ namespace GameMod
         };
 
         private static GameObject s_tickerGo = null;
+
+        // True once the GlobalFog check has run with a live camera (so
+        // the ticker does not re-scan every 5 s). False while Camera.main
+        // is still null, so a later tick retries.
+        private static bool s_globalFogHandled = false;
+
+        // Disable the Main Camera GlobalFog image effect when a D3 sky is
+        // present (Option B). String lookup on purpose: no compile-time
+        // dependency on Assembly-CSharp-firstpass.dll (GlobalFog lives
+        // there, not in Assembly-CSharp.dll). Only flips the camera
+        // Behaviour's enabled flag -- RenderSettings, materials and level
+        // objects are untouched, so D3 room fog (in-level fog-carrier
+        // entities) is unaffected. Fail-open: any failure is logged.
+        internal static void DisableGlobalFogIfSky()
+        {
+            if (s_globalFogHandled)
+                return;
+            try
+            {
+                Camera cam = null;
+                try { cam = Camera.main; }
+                catch (Exception) { return; }
+                if (cam == null)
+                    return;
+                Behaviour gf = null;
+                try { gf = cam.GetComponent("GlobalFog") as Behaviour; }
+                catch (Exception) { }
+                Debug.Log(kTag + " GlobalFog found=" + (gf != null) + " enabled=" + (gf != null && gf.enabled));
+                if (gf != null && gf.enabled)
+                {
+                    gf.enabled = false;
+                    Debug.Log(kTag + " disabled Main Camera GlobalFog (D3 sky present)");
+                }
+                s_globalFogHandled = true;
+            }
+            catch (Exception ex)
+            {
+                Debug.Log(kTag + " GlobalFog disable failed (fail open): " + ex.ToString());
+                s_globalFogHandled = true;
+            }
+        }
 
         [HarmonyPatch(typeof(GameplayManager), "StartLevel")]
         public static class StartLevelPatch
@@ -162,6 +221,8 @@ namespace GameMod
                     RenderSettings.fog = false;
                     Debug.Log(kTag + " RenderSettings.fog was ON with a D3 sky present -> set OFF (Fog Mode Off for the sky; D3 room fog is a separate effect and is unaffected)");
                 }
+                if (skyPresent)
+                    DisableGlobalFogIfSky();
             }
             catch (Exception ex)
             {
@@ -189,10 +250,12 @@ namespace GameMod
 
     // Re-asserts farClip every 5 s while a level is loaded. The probe
     // showed farClip stable, so this should stay silent; it only logs
-    // when it actually changes something. (Fog is a level-load guard
-    // only -- it is not re-asserted here, since nothing in the game
-    // changes it per-frame and re-asserting it could fight a level
-    // that wants fog.)
+    // when it actually changes something. (RenderSettings fog is a
+    // level-load guard only -- it is not re-asserted here, since nothing
+    // in the game changes it per-frame and re-asserting it could fight a
+    // level that wants fog. The GlobalFog disable IS re-asserted here
+    // until it has run once with a live camera, to cover a null
+    // Camera.main at level load; after that it is a no-op.)
     public class SkyFarClipTicker : MonoBehaviour
     {
         private const float kTickInterval = 5.0f;
@@ -202,12 +265,41 @@ namespace GameMod
         {
             try
             {
+                // Debug key F7 (unbound in Overload): toggle the Main
+                // Camera GlobalFog image effect live + log. Proves the
+                // sky-circle cause mid-flight if the circle persists
+                // after the level-load fix. Checked every frame, outside
+                // the 5 s gate, so it responds immediately.
+                if (Input.GetKeyDown(KeyCode.F7))
+                {
+                    try
+                    {
+                        Behaviour gf = null;
+                        Camera cam = Camera.main;
+                        if (cam != null)
+                            gf = cam.GetComponent("GlobalFog") as Behaviour;
+                        if (gf != null)
+                        {
+                            gf.enabled = !gf.enabled;
+                            Debug.Log("[SKY FIX] F7 GlobalFog toggled enabled=" + gf.enabled);
+                        }
+                        else
+                        {
+                            Debug.Log("[SKY FIX] F7 GlobalFog not found on Main Camera");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.Log("[SKY FIX] F7 toggle failed: " + ex.ToString());
+                    }
+                }
                 if (GameManager.m_player_ship == null)
                     return;
                 if (Time.time < m_nextCheck)
                     return;
                 m_nextCheck = Time.time + kTickInterval;
                 SkyFarClipPatch.EnsureFarClip();
+                SkyFarClipPatch.DisableGlobalFogIfSky();
             }
             catch (Exception ex)
             {
