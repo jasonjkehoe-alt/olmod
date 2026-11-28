@@ -152,7 +152,6 @@
     <Compile Include="SkyFarClip.cs" />
     <Compile Include="SkyboxFix.cs" />
     <Compile Include="SwatterHp.cs" />
-    <Compile Include="SwatterFire.cs" />
     <Compile Include="TextureMotionManager.cs" />
     <Compile Include="RelentlessGoblin.cs" />
     <Compile Include="JoystickCurveEditor.cs" />
