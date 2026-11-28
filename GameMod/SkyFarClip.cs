@@ -76,7 +76,12 @@ namespace GameMod
 
         // True once the GlobalFog check has run with a live camera (so
         // the ticker does not re-scan every 5 s). False while Camera.main
-        // is still null, so a later tick retries.
+        // is still null, so a later tick retries. Reset to false on
+        // every level load (OnLevelLoaded): a reload builds a FRESH
+        // Main Camera whose GlobalFog comes back enabled from the ship
+        // prefab, so the disable must re-run per load (Nov 28 reload
+        // bug -- the circle returned on 2nd/3rd loads because the guard
+        // stayed set from load 1).
         private static bool s_globalFogHandled = false;
 
         // Disable the Main Camera GlobalFog image effect when a D3 sky is
@@ -222,7 +227,21 @@ namespace GameMod
                     Debug.Log(kTag + " RenderSettings.fog was ON with a D3 sky present -> set OFF (Fog Mode Off for the sky; D3 room fog is a separate effect and is unaffected)");
                 }
                 if (skyPresent)
+                {
+                    // Nov 28 reload bug: each level load builds a FRESH
+                    // Main Camera whose GlobalFog comes back enabled
+                    // from the ship prefab (serialized m_Enabled=1),
+                    // but the once-guard stayed set from load 1, so the
+                    // disable never re-ran and the sky circle returned
+                    // on reload (flight log: load 1 disables it, loads
+                    // 2-3 have no GlobalFog lines at all). Reset the
+                    // guard every load so the disable runs against the
+                    // fresh camera. Safe: the disable only flips the
+                    // flag when gf.enabled is true, and it still no-ops
+                    // within a load once it has run.
+                    s_globalFogHandled = false;
                     DisableGlobalFogIfSky();
+                }
             }
             catch (Exception ex)
             {
